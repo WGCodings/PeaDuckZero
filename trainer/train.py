@@ -31,6 +31,18 @@ them; a flag given on the command line overrides the stored value and is
 saved. --init starts a new run from another run's checkpoint.pt (its size
 and weights, fresh optimizer).
 
+Warm start of a bigger network from a smaller one (the teacher):
+
+    python train.py --run ..\\runs\\big --net 96x8 --teacher ..\\runs\\first\\checkpoint.pt `
+        --seed-data ..\\runs\\first\\data
+
+* --seed-data: the teacher's recent self-play games fill the replay buffer
+  and the new network trains on them for --seed-epochs passes before the
+  first generation.
+* --teacher: for the first --teacher-gens generations the self-play games
+  are played by the teacher (with the run's search settings); the new
+  network trains on them. After that it plays its own games.
+
 A live dashboard opens at http://localhost:8765 while training; see
 --dashboard-port / --no-browser.
 
@@ -76,6 +88,8 @@ def net_size(s):
 # a turn: 2 per turn.
 DEFAULTS = {
     "net": "64x6", "generations": 1000,
+    # warm start: self-play by another run's network for the first generations
+    "teacher": None, "teacher_gens": 30,
     # self-play
     "games": 1024, "simulations": 64, "considered": 16, "max_plies": 1024, "threads": 0,
     "fast_simulations": 0, "full_prob": 0.25, "fast_considered": 8,
@@ -100,6 +114,13 @@ def parse_args():
     ap.add_argument("--init", help="new run only: start from this checkpoint.pt (its size and weights)")
     ap.add_argument("--net", help="network size CHANNELSxBLOCKS, e.g. 64x6, 96x8, 128x10")
     ap.add_argument("--generations", type=int, help="total generations to reach")
+    ap.add_argument("--teacher", help="checkpoint.pt of another run whose network plays the self-play games "
+                                      "for the first --teacher-gens generations ('none' = off)")
+    ap.add_argument("--teacher-gens", type=int, help="generations of teacher self-play (default 30)")
+    ap.add_argument("--seed-data", help="new run only: a data folder of another run (e.g. ..\\runs\\first\\data); "
+                                        "its newest games fill the replay buffer and are trained on first")
+    ap.add_argument("--seed-epochs", type=float, default=2.0,
+                    help="passes over the --seed-data positions before the first generation (default 2)")
     # self-play
     ap.add_argument("--games", type=int, help="concurrent self-play games")
     ap.add_argument("--simulations", type=int, help="tree-search simulations per step (Gumbel search)")
@@ -317,6 +338,55 @@ def variety_settings(args):
     return kw
 
 
+def seed_from_data(args, net, opt, scaler, replay, dev, amp, status):
+    """Fill the replay buffer with the newest games of another run's data
+    folder and train on them for --seed-epochs passes (new runs only)."""
+    p = os.path.abspath(args.seed_data)  # the run folder or its data folder
+    gens = data_gen_dirs(p if os.path.isdir(os.path.join(p, "data")) else os.path.dirname(p))
+    if not gens:
+        sys.exit(f"--seed-data: no gen_XXXX folders in {args.seed_data}")
+    loaded = 0
+    for _, d in gens[-replay_gens(args):]:
+        for path in sorted(glob.glob(os.path.join(d, "*.bin"))):
+            with open(path, "rb") as f:
+                replay.add_chunk(f.read())
+            loaded += 1
+    n_steps = max(1, int(replay.positions * args.seed_epochs / args.batch))
+    print(f"seed data: {replay.positions:,} positions from {loaded} chunks of {args.seed_data}; "
+          f"training {n_steps:,} steps ({args.seed_epochs:g} passes) before generation 1")
+    net.train()
+    t0 = time.time()
+    sums, count = {}, 0
+    status.update(force=True, phase="training", phase_start=t0, steps_done=0, steps_total=n_steps,
+                  replay_positions=replay.positions)
+    batch = batch_to_device(replay.sample(args.batch), dev)
+    for step in range(1, n_steps + 1):
+        lr = args.lr * min(1.0, step / args.warmup)
+        for g in opt.param_groups:
+            g["lr"] = lr
+        loss, m = az_loss(net, batch, dev, amp, q_ratio=args.q_ratio)
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        if step < n_steps:
+            batch = batch_to_device(replay.sample(args.batch), dev)
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
+        scaler.step(opt)
+        scaler.update()
+        for k, v in m.items():
+            sums[k] = sums[k] + v if k in sums else v
+        count += 1
+        if step % 500 == 0 or step == n_steps:
+            avg = {k: float(v) / count for k, v in sums.items()}
+            print(f"  seed step {step:6d}/{n_steps} | loss {avg['loss']:.3f} (p {avg['policy_loss']:.3f} "
+                  f"v {avg['value_loss']:.3f} agree {avg['policy_agreement']:.2f}) | {time.time() - t0:.0f}s",
+                  flush=True)
+            sums, count = {}, 0
+            status.update(steps_done=step, step=step)
+    args.seed_steps_done = n_steps
+    net.eval()
+
+
 class PlainPool:
     """One pool driven by the plain loop (train_lib.search_step)."""
 
@@ -401,6 +471,14 @@ def train(args, status):
         print(f"started from {args.init} ({cfg.channels}x{cfg.blocks}, generation {ick.get('generation')})")
 
     replay = pz.Replay(capacity=args.replay, seed=args.seed + gen)
+    teacher = None
+    if args.teacher and args.teacher.lower() != "none" and gen < args.teacher_gens:
+        tck = torch.load(args.teacher, map_location="cpu", weights_only=False)
+        teacher = DuckNet(NetConfig(**tck["config"])).to(dev)
+        teacher.load_state_dict(tck["model"])
+        teacher = eval_net(teacher)
+        print(f"teacher: {args.teacher} ({teacher.cfg.channels}x{teacher.cfg.blocks}, generation "
+              f"{tck.get('generation')}) plays the self-play games up to generation {args.teacher_gens}")
     if args.resume:  # refill the replay buffer, oldest data first
         refill = data_gen_dirs(args.run)[-replay_gens(args):]
         for _, d in refill:
@@ -408,6 +486,9 @@ def train(args, status):
                 with open(path, "rb") as f:
                     replay.add_chunk(f.read())
         print(f"replay buffer: {replay.positions:,} positions from {len(refill)} generations on disk")
+    if args.seed_data and gen == 0:
+        seed_from_data(args, net, opt, scaler, replay, dev, amp, status)
+        step = args.seed_steps_done
     prune_nets(args, gen)
 
     n_pools = max(1, args.pools)
@@ -450,7 +531,7 @@ def train(args, status):
     status.update(force=True, net=net_name, params=params, device=dev.type, amp=amp, step=step,
                   generation=gen, session_start_generation=gen, replay_positions=replay.positions)
 
-    sp_net = eval_net(net)
+    sp_net = teacher if teacher is not None else eval_net(net)
     if runner:
         runner.set_net(sp_net)
         if runner.graphs_wanted and not runner.graphs:
@@ -461,6 +542,7 @@ def train(args, status):
     while gen < args.generations:
         gen += 1
         # ---------------------------------------------------------------- self-play
+        by_teacher = teacher is not None
         t0 = time.time()
         new_positions, new_games, new_plies, part = 0, 0, 0, 0
         gen_keys = []
@@ -548,12 +630,16 @@ def train(args, status):
         # ---------------------------------------------------------------- save
         status.update(force=True, phase="saving", steps_done=n_steps, step=step)
         net.eval()
-        sp_net = eval_net(net)
-        ev = eval_metrics(sp_net, replay, dev, amp)
+        student = eval_net(net)
+        ev = eval_metrics(student, replay, dev, amp)
+        if teacher is not None and gen >= args.teacher_gens:
+            print(f"generation {gen}: teacher done, the network plays its own games from now on")
+            teacher = None
+        sp_net = teacher if teacher is not None else student
         if runner:
             runner.set_net(sp_net)
         net_path = os.path.join(args.run, "nets", f"gen_{gen:04d}.pdn")
-        export_pdn(sp_net, net_path)
+        export_pdn(student, net_path)
         shutil.copyfile(net_path, os.path.join(args.run, "latest.pdn"))
         prune_data(args)
         prune_nets(args, gen)
@@ -572,10 +658,12 @@ def train(args, status):
                 "sp_rust_seconds": round(sp_timing["rust"], 1),
                 "sp_launch_seconds": round(sp_timing["launch"], 1)} if sp_timing else {}),
             **uniq,
-            "results": d, "terminations": terms, "replay_positions": replay.positions, "qat": net.qat, **avg, **ev,
+            "results": d, "terminations": terms, "replay_positions": replay.positions, "qat": net.qat,
+            "teacher_selfplay": by_teacher,
+            **avg, **ev,
         }
         log(args.run, record)
-        print(f"gen {gen:4d} | selfplay {sp_time:6.1f}s {moves / sp_time:7.0f} steps/s "
+        print(f"gen {gen:4d}{' T' if record['teacher_selfplay'] else ''} | selfplay {sp_time:6.1f}s {moves / sp_time:7.0f} steps/s "
               + (f"(gpu wait {sp_timing['gpu_wait']:.0f}s rust {sp_timing['rust']:.0f}s "
                  f"launch {sp_timing['launch']:.0f}s) " if sp_timing else "")
               + f"{new_games:5d} games (W{d['white_wins']} D{d['draws']} B{d['black_wins']}, "

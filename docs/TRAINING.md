@@ -91,6 +91,35 @@ python train.py --run ..\runs\first --net 64x6 --simulations 64 --fast-simulatio
   own, or distillation from the smaller network's games, which hasn't been
   ported from PeaZero yet.
 
+## A bigger network, warm-started by a smaller one
+
+A new, larger network doesn't have to start from random play. A trained
+smaller run can serve as its teacher:
+
+```powershell
+python train.py --run ..\runs\big --net 96x8 --teacher ..\runs\first\checkpoint.pt `
+    --seed-data ..\runs\first --simulations 128 --fast-simulations 32
+```
+
+1. **Seed data:** the teacher run's newest games (as many generations as
+   the replay buffer holds) are loaded, and the new network trains on them
+   for `--seed-epochs` passes (default 2) before generation 1.
+2. **Teacher self-play:** for the first `--teacher-gens` generations
+   (default 30) the teacher plays the self-play games with this run's
+   search settings, and the new network learns from those games. The
+   console marks these generations with `T`.
+3. **Own games:** after that the new network plays itself, and the run
+   carries on like any other (`--resume`, learning-rate drops, `--qat`).
+
+* **The teacher must be finished first:** use its final checkpoint, e.g.
+  after the 64×6's last learning-rate drop with QAT. A copy of that
+  `checkpoint.pt` is safest, since the teacher run's file changes while it
+  trains.
+* **Checking the warm start:** compare the new network with the teacher
+  around the switch (fixed nodes first, then your time control, since the
+  bigger network is slower). The ladder in the dashboard only compares the
+  new run's own generations.
+
 ## Testing a network
 
 * **In the engine:** `setoption name EvalFile value C:\...\runs\first\nets\gen_0100.pdn`,
