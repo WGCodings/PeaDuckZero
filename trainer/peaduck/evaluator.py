@@ -130,8 +130,8 @@ def run_match(args, nets, g, status):
             r = json.loads(line)
             if r.get("final", True):
                 result = r
-        elif line.startswith("["):
-            status.set("running", f"gen {g} vs {opp} {line.split(']')[0][1:]}")
+        elif line.startswith("Finished game"):
+            status.set("running", f"gen {g} vs {opp}: {line.split(' (')[0][9:]}")
     proc.wait()
     if result is None:
         raise RuntimeError(f"duckmatch failed (exit {proc.returncode})")

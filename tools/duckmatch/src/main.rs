@@ -29,6 +29,7 @@
 //! * `--margin MS`: time a side may overstep its clock (default 100).
 //! * `--log FILE`: one line per game (result, termination, opening, moves).
 //! * `--seed S`: opening seed (default 0).
+//! * `--report N`: print the results block every N games (default 10).
 //! * `--json`: also print the summary as one JSON line, every 10 games
 //!   (`"final": false`) and at the end (`"final": true`).
 
@@ -84,6 +85,10 @@ struct Config {
     margin_ms: u64,
     log: Option<String>,
     json: bool,
+    /// results block every this many games (`--report`)
+    report_every: usize,
+    /// openings, for the header
+    opening_desc: String,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +242,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
     let mut log = None;
     let mut seed = 0u64;
     let mut json = false;
+    let mut report_every: usize = 10;
     let mut i = 0;
     let value = |i: usize| -> Result<&String, String> {
         args.get(i + 1)
@@ -309,6 +315,10 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
                 i += 1;
             }
             "--json" => json = true,
+            "--report" => {
+                report_every = value(i)?.parse().map_err(|_| "bad --report")?;
+                i += 1;
+            }
             "-h" | "--help" => return Err(String::new()),
             _ => return Err(format!("unknown argument {a:?}")),
         }
@@ -338,6 +348,12 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         specs[1].name.push_str("-2");
     }
     let pairs = games.div_ceil(2).max(1);
+    let opening_desc = match &openings_file {
+        Some(p) => std::path::Path::new(p)
+            .file_name()
+            .map_or(p.clone(), |f| f.to_string_lossy().into_owned()),
+        None => format!("{random_turns} random turns"),
+    };
     let openings = match openings_file {
         Some(path) => {
             let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -364,6 +380,8 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         margin_ms,
         log,
         json,
+        report_every: report_every.max(1),
+        opening_desc,
     })
 }
 
@@ -582,6 +600,20 @@ fn play_game(
     }
 }
 
+/// "king capture", "the fifty-move rule", ... for the per-game lines.
+fn ending_words(t: &str) -> String {
+    match t {
+        "KingCaptured" => "king capture".into(),
+        "NoMoves" => "having no legal move".into(),
+        "FiftyMoves" => "the fifty-move rule".into(),
+        "Repetition" => "threefold repetition".into(),
+        "MaxTurns" => "adjudication (turn limit)".into(),
+        "TimeForfeit" => "time forfeit".into(),
+        "EngineError" => "engine error".into(),
+        other => other.to_string(),
+    }
+}
+
 fn worker(
     cfg: Arc<Config>,
     jobs: Arc<Mutex<Vec<(usize, usize)>>>,
@@ -646,6 +678,8 @@ struct Stats {
     losses: usize,
     /// pairs scoring 0, 0.5, 1, 1.5, 2 for engine 0
     penta: [usize; 5],
+    /// pairs scoring 1 as a win and a loss (the rest of penta[2] are two draws)
+    wl_pairs: usize,
 }
 
 impl Stats {
@@ -702,26 +736,105 @@ fn bounds(s: &Sprt) -> (f64, f64) {
     )
 }
 
+/// Standard normal CDF (Abramowitz–Stegun 7.1.26 erf, |error| < 1.5e-7).
+fn phi(x: f64) -> f64 {
+    let z = x.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.327_591_1 * z);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let erf = 1.0 - poly * (-z * z).exp();
+    0.5 * (1.0 + if x >= 0.0 { erf } else { -erf })
+}
+
+/// "8+0.08, 1t, 16MB" for the header.
+fn conditions(e: &EngineSpec) -> String {
+    let limit = match e.limit {
+        Limit::Clock(base, inc) => format!("{}+{}", base as f64 / 1000.0, inc as f64 / 1000.0),
+        Limit::Nodes(n) => format!("{n} nodes"),
+        Limit::MoveTime(ms) => format!("{ms}ms/move"),
+        Limit::Unset => "?".into(),
+    };
+    let opt = |name: &str| {
+        e.options
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let mut s = limit;
+    s.push_str(&format!(", {}t", opt("Threads").unwrap_or_else(|| "1".into())));
+    s.push_str(&format!(", {}MB", opt("Hash").unwrap_or_else(|| "16".into())));
+    if let Some(net) = opt("EvalFile") {
+        let short = std::path::Path::new(&net)
+            .file_name()
+            .map_or(net.clone(), |f| f.to_string_lossy().into_owned());
+        s.push_str(&format!(", {short}"));
+    }
+    s
+}
+
+/// The results block, in fastchess's layout.
 fn summary(cfg: &Config, st: &Stats, terms: &BTreeMap<String, usize>) -> String {
     let games = st.wins + st.draws + st.losses;
-    let mut s = format!(
-        "{} vs {}: games {games} (+{} ={} -{}) penta {:?}",
-        cfg.engines[0].name, cfg.engines[1].name, st.wins, st.draws, st.losses, st.penta
-    );
-    if let Some((elo, err)) = st.elo() {
-        s.push_str(&format!(" | Elo {elo:+.1} +- {err:.1}"));
+    let (a, b) = (&cfg.engines[0], &cfg.engines[1]);
+    let (ca, cb) = (conditions(a), conditions(b));
+    let cond = if ca == cb {
+        ca
+    } else {
+        format!("{ca} vs {cb}")
+    };
+    let line = "-".repeat(50);
+    let mut s = format!("{line}\nResults of {} vs {} ({cond}, {}):\n", a.name, b.name, cfg.opening_desc);
+    let pairs = st.pairs();
+    match (st.elo(), st.pair_mean_var()) {
+        (Some((elo, err)), Some((mean, var))) if pairs > 0 => {
+            let k = 800.0 / std::f64::consts::LN_10;
+            let (nelo, nerr) = if var > 0.0 {
+                (
+                    (mean - 0.5) / (2.0 * var).sqrt() * k,
+                    1.959_964 / (2.0 * pairs as f64).sqrt() * k,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            let se = (var / pairs as f64).sqrt();
+            let los = if se > 0.0 { phi((mean - 0.5) / se) } else { 0.5 };
+            s.push_str(&format!("Elo: {elo:.2} +/- {err:.2}, nElo: {nelo:.2} +/- {nerr:.2}\n"));
+            let pr = (st.penta[3] + st.penta[4]) as f64 / (st.penta[0] + st.penta[1]).max(1) as f64;
+            s.push_str(&format!(
+                "LOS: {:.2} %, DrawRatio: {:.2} %, PairsRatio: {pr:.2}\n",
+                100.0 * los,
+                100.0 * st.draws as f64 / games.max(1) as f64
+            ));
+        }
+        _ => s.push_str("Elo: - (no complete pair yet)\n"),
     }
+    let points = st.wins as f64 + 0.5 * st.draws as f64;
+    s.push_str(&format!(
+        "Games: {games}, Wins: {}, Losses: {}, Draws: {}, Points: {points:.1} ({:.2} %)\n",
+        st.wins,
+        st.losses,
+        st.draws,
+        100.0 * points / games.max(1) as f64
+    ));
+    let dd = st.penta[2] - st.wl_pairs;
+    s.push_str(&format!(
+        "Ptnml(0-2): {:?}, WL/DD Ratio: {:.2}\n",
+        st.penta,
+        st.wl_pairs as f64 / dd.max(1) as f64
+    ));
     if let Some(sp) = &cfg.sprt {
         let (lo, hi) = bounds(sp);
         s.push_str(&format!(
-            " | LLR {:.2} ({lo:.2}, {hi:.2}) [{}, {}]",
+            "LLR: {:.2} ({lo:.2}, {hi:.2}) [{:.2}, {:.2}]\n",
             st.llr(sp),
             sp.elo0,
             sp.elo1
         ));
     }
     let t: Vec<String> = terms.iter().map(|(k, v)| format!("{k} {v}")).collect();
-    s.push_str(&format!(" | {}", t.join(", ")));
+    s.push_str(&format!("Endings: {}\n{line}", t.join(", ")));
     s
 }
 
@@ -774,6 +887,7 @@ fn main() {
         draws: 0,
         losses: 0,
         penta: [0; 5],
+        wl_pairs: 0,
     };
     let mut terms: BTreeMap<String, usize> = BTreeMap::new();
     let mut half: HashMap<usize, f64> = HashMap::new();
@@ -794,9 +908,24 @@ fn main() {
         *terms.entry(g.termination.clone()).or_default() += 1;
         if let Some(prev) = half.remove(&g.pair) {
             st.penta[((prev + g.score0) * 2.0).round() as usize] += 1;
+            if (prev - 0.5).abs() > 0.25 && (prev + g.score0 - 1.0).abs() < 0.25 {
+                st.wl_pairs += 1;
+            }
         } else {
             half.insert(g.pair, g.score0);
         }
+        let (white, black) = (&cfg.engines[g.white].name, &cfg.engines[1 - g.white].name);
+        let how = match g.result {
+            "1-0" => "White wins",
+            "0-1" => "Black wins",
+            _ => "Draw",
+        };
+        println!(
+            "Finished game {done} of {} ({white} vs {black}): {} {{{how} by {}}}",
+            cfg.games,
+            g.result,
+            ending_words(&g.termination)
+        );
         if let Some(f) = log.as_mut() {
             let _ = writeln!(
                 f,
@@ -808,13 +937,8 @@ fn main() {
                 g.turns.join(" ")
             );
         }
-        if done % 10 == 0 || done == cfg.games {
-            println!(
-                "[{done}/{}, {:.0}s] {}",
-                cfg.games,
-                start.elapsed().as_secs_f64(),
-                summary(&cfg, &st, &terms)
-            );
+        if done % cfg.report_every == 0 && done != cfg.games {
+            println!("{}", summary(&cfg, &st, &terms));
             if cfg.json {
                 println!("{}", json_line(&cfg, &st, &terms, None, total_turns, done, false));
             }
@@ -835,9 +959,11 @@ fn main() {
     for h in handles {
         let _ = h.join();
     }
-    println!("final: {}", summary(&cfg, &st, &terms));
+    println!("{}", summary(&cfg, &st, &terms));
     if let Some(d) = decided {
-        println!("SPRT: {d}");
+        println!("SPRT ({d}) after {done} games, {:.0}s", start.elapsed().as_secs_f64());
+    } else {
+        println!("Finished match: {done} games, {:.0}s", start.elapsed().as_secs_f64());
     }
     if cfg.json {
         println!("{}", json_line(&cfg, &st, &terms, decided, total_turns, done, true));
@@ -882,6 +1008,7 @@ mod tests {
             draws: 0,
             losses: 0,
             penta: [10, 40, 100, 40, 10],
+            wl_pairs: 0,
         };
         let (elo, err) = even.elo().unwrap();
         assert!(elo.abs() < 1e-6 && err > 0.0);
