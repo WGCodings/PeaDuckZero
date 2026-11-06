@@ -1,0 +1,12 @@
+[package]
+name = "peaduck-core"
+description = "Duck chess board representation, move generation and perft for PeaDuckZero"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "peaduck_core"
+
+[dependencies]

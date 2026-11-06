@@ -1,0 +1,10 @@
+[package]
+name = "duckmatch"
+description = "Match runner (UCI duck chess games between engines, SPRT) for PeaDuckZero"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+peaduck-core = { path = "../../crates/core" }

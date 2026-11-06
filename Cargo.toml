@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/core", "crates/nn", "crates/selfplay", "crates/py", "engine", "tools/duckmatch"]
+# crates/py is a Python extension (built with pip / maturin), not part of
+# plain `cargo build` / `cargo test`.
+default-members = ["crates/core", "crates/nn", "crates/selfplay", "engine", "tools/duckmatch"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["WG"]
+license = "GPL-3.0-or-later"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+debug = false
+
+[profile.release.package.peaduck-core]
+codegen-units = 1
+
+# Tests run with `cargo test --release`; keep them fast but unwinding.
+[profile.test]
+opt-level = 3

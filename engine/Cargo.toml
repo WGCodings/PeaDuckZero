@@ -1,0 +1,16 @@
+[package]
+name = "peaduckzero"
+description = "PeaDuckZero UCI duck chess engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "peaduckzero"
+path = "src/main.rs"
+
+[dependencies]
+peaduck-core = { path = "../crates/core" }
+peaduck-nn = { path = "../crates/nn" }

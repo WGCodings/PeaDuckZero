@@ -1,0 +1,11 @@
+[package]
+name = "peaduck-selfplay"
+description = "Gumbel self-play, training data format and replay sampling for PeaDuckZero"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+peaduck-core = { path = "../core" }
+rayon = "1.10"

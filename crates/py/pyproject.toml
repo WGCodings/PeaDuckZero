@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "peaduck-rs"
+description = "Rust core of the PeaDuckZero trainer: self-play game pool and replay buffer"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[tool.maturin]
+module-name = "peaduck_rs"
+features = ["pyo3/extension-module"]

@@ -1,0 +1,17 @@
+[package]
+name = "peaduck-py"
+description = "Python bindings (self-play pool + replay buffer) for the PeaDuckZero trainer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "peaduck_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+peaduck-core = { path = "../core" }
+peaduck-selfplay = { path = "../selfplay" }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"] }
+numpy = "0.30"

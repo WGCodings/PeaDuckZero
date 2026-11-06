@@ -1,0 +1,10 @@
+[package]
+name = "peaduck-nn"
+description = "Network inference for PeaDuckZero (hand-written x86-64 SIMD)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+peaduck-core = { path = "../core" }
