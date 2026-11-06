@@ -113,6 +113,8 @@ python tools\sprt.py --list                     # history of all tests
   runs out, or Ctrl+C).
 * Every test is appended to `.sprt/results.jsonl` (refs, commits, settings,
   Elo, LLR, verdict); games go to `.sprt/logs`.
+* `python tools\sprt.py --dashboard` shows all tests in the browser
+  (http://localhost:8766), running ones live, like OpenBench's test list.
 * `--dev-net` / `--base-net` give each side another network; `--evalfile`
   embeds one network in both builds.
 

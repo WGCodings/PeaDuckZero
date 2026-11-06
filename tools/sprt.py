@@ -6,6 +6,7 @@ them with duckmatch, keep a history.
     python tools\\sprt.py my-feature master --elo1 10 --concurrency 7
     python tools\\sprt.py my-feature --nodes 800         # fixed nodes instead of a clock
     python tools\\sprt.py --list                         # earlier tests
+    python tools\\sprt.py --dashboard                    # all tests in the browser (like OpenBench)
 
 * Each ref is checked out in a temporary git worktree and built with
   `cargo build --release -p peaduckzero` (shared target folder, so the
@@ -16,7 +17,9 @@ them with duckmatch, keep a history.
   (both builds) or --dev-net / --base-net (UCI EvalFile per side) are given.
 * duckmatch is built from the current checkout.
 * Every test appends one line to .sprt/results.jsonl (date, refs, commits,
-  settings, Elo, LLR, verdict); the games go to .sprt/logs/.
+  settings, Elo, LLR, verdict); the games go to .sprt/logs/. A running test
+  keeps its live score in .sprt/running/ (updated every 10 games), so the
+  dashboard shows it too.
 """
 import argparse
 import datetime
@@ -114,6 +117,10 @@ def main():
     ap.add_argument("dev", nargs="?", help="branch/commit with the change")
     ap.add_argument("base", nargs="?", default="main", help="branch/commit to compare against (default main)")
     ap.add_argument("--list", action="store_true", help="show earlier tests and exit")
+    ap.add_argument("--dashboard", action="store_true",
+                    help="serve the test dashboard (http://localhost:8766) and exit with Ctrl+C")
+    ap.add_argument("--port", type=int, default=8766, help="dashboard port")
+    ap.add_argument("--no-browser", action="store_true", help="don't open the dashboard in a browser")
     ap.add_argument("--tc", default="8+0.08", help="time control base+inc seconds (default 8+0.08)")
     ap.add_argument("--nodes", type=int, help="fixed playouts per move instead of --tc")
     ap.add_argument("--elo0", type=float, default=0.0)
@@ -133,6 +140,9 @@ def main():
 
     if args.list:
         list_results()
+        return
+    if args.dashboard:
+        serve_dashboard(args.port, not args.no_browser)
         return
     if not args.dev:
         ap.error("give the branch to test (and optionally the base, default main)")
@@ -170,36 +180,135 @@ def main():
     print(f"SPRT [{args.elo0:g}, {args.elo1:g}] {limit}, {args.concurrency} games at a time; games -> {log}",
           flush=True)
 
+    test_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    record = {"id": test_id, "date": stamp, "started": datetime.datetime.now().timestamp(),
+              "dev": args.dev, "dev_sha": dev_sha, "dev_msg": dev_msg,
+              "base": args.base, "base_sha": base_sha, "base_msg": base_msg,
+              "limit": limit, "elo0": args.elo0, "elo1": args.elo1, "alpha": args.alpha, "beta": args.beta,
+              "hash": args.hash, "threads": args.threads, "concurrency": args.concurrency,
+              "max_games": args.games, "openings": args.openings or "random turns",
+              "dev_net": args.dev_net, "base_net": args.base_net, "evalfile": args.evalfile,
+              "games": 0, "wins": 0, "draws": 0, "losses": 0, "pentanomial": [0, 0, 0, 0, 0],
+              "elo": 0.0, "elo_error": 0.0, "llr": 0.0, "verdict": "running", "terminations": {},
+              "log": os.path.relpath(log, REPO)}
+    running = os.path.join(SPRT_DIR, "running", f"{test_id}.json")
+    os.makedirs(os.path.dirname(running), exist_ok=True)
+
+    def update(result, verdict):
+        for k in ("games", "wins", "draws", "losses", "pentanomial", "elo", "elo_error", "llr", "terminations"):
+            record[k] = result[k]
+        record["verdict"] = verdict
+        record["updated"] = datetime.datetime.now().timestamp()
+        record["seconds"] = round(record["updated"] - record["started"])
+        tmp = running + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(record, f)
+        os.replace(tmp, running)
+
+    update(record, "running")
     result, stopped = None, False
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         for line in proc.stdout:
             if line.startswith("{"):
                 result = json.loads(line)  # progress every 10 games, then the final one
+                update(result, "running")
             else:
                 print(line, end="", flush=True)
         proc.wait()
     except KeyboardInterrupt:
         stopped = True  # Ctrl+C reaches duckmatch too: keep the last progress line
         proc.kill()
+    try:
+        os.remove(running)
+    except OSError:
+        pass
     if result is None:
         print("no result recorded (stopped before 10 games)")
         return
     if stopped or not result.get("final"):
-        result["sprt"] = "stopped"
-    elif result["sprt"] is None:
-        result["sprt"] = "max games"
-    record = {"date": stamp, "dev": args.dev, "dev_sha": dev_sha, "dev_msg": dev_msg,
-              "base": args.base, "base_sha": base_sha, "base_msg": base_msg,
-              "limit": limit, "elo0": args.elo0, "elo1": args.elo1, "hash": args.hash, "threads": args.threads,
-              "dev_net": args.dev_net, "base_net": args.base_net, "evalfile": args.evalfile,
-              "games": result["games"], "wins": result["wins"], "draws": result["draws"],
-              "losses": result["losses"], "pentanomial": result["pentanomial"], "elo": result["elo"],
-              "elo_error": result["elo_error"], "llr": result["llr"], "verdict": result["sprt"],
-              "terminations": result["terminations"], "log": os.path.relpath(log, REPO)}
+        verdict = "stopped"
+    else:
+        verdict = result["sprt"] or "max games"
+    update(result, verdict)
+    os.remove(running)
+    record.pop("updated", None)
     with open(os.path.join(SPRT_DIR, "results.jsonl"), "a") as f:
         f.write(json.dumps(record) + "\n")
-    print(f"saved to .sprt/results.jsonl (python tools/sprt.py --list)")
+    print("saved to .sprt/results.jsonl (python tools/sprt.py --list, or --dashboard)")
+
+
+# ---------------------------------------------------------------------- dashboard
+
+def load_tests():
+    """Finished tests (results.jsonl) and running ones (.sprt/running), newest first."""
+    tests = []
+    path = os.path.join(SPRT_DIR, "results.jsonl")
+    if os.path.exists(path):
+        for n, line in enumerate(open(path)):
+            if line.strip():
+                t = json.loads(line)
+                t.setdefault("id", f"old-{n}")
+                tests.append(t)
+    rdir = os.path.join(SPRT_DIR, "running")
+    if os.path.isdir(rdir):
+        now = datetime.datetime.now().timestamp()
+        for name in os.listdir(rdir):
+            if name.endswith(".json"):
+                try:
+                    t = json.load(open(os.path.join(rdir, name)))
+                except (OSError, ValueError):
+                    continue
+                # no update for 15 minutes: the run was killed
+                if now - t.get("updated", now) > 900:
+                    t["verdict"] = "interrupted"
+                tests.append(t)
+    tests.sort(key=lambda t: t.get("started") or 0, reverse=True)
+    return tests
+
+
+def serve_dashboard(port, open_browser):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import webbrowser
+
+    page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sprt_dashboard.html")
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, body, ctype):
+            body = body.encode() if isinstance(body, str) else body
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/api/tests"):
+                self.reply(json.dumps(load_tests()), "application/json")
+            elif self.path.startswith("/log/"):
+                tid = self.path[5:]
+                t = next((t for t in load_tests() if t.get("id") == tid), None)
+                path = t and os.path.join(REPO, t.get("log", ""))
+                if path and os.path.isfile(path):
+                    self.reply(open(path, "rb").read(), "text/plain; charset=utf-8")
+                else:
+                    self.send_error(404)
+            else:
+                self.reply(open(page, "rb").read(), "text/html; charset=utf-8")
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), H)
+    url = f"http://localhost:{port}"
+    print(f"SPRT dashboard: {url}  (Ctrl+C to stop)")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
