@@ -915,10 +915,11 @@ fn main() {
             half.insert(g.pair, g.score0);
         }
         let (white, black) = (&cfg.engines[g.white].name, &cfg.engines[1 - g.white].name);
+        // the winner's engine name first, so a run of wins is easy to spot
         let how = match g.result {
-            "1-0" => "White wins",
-            "0-1" => "Black wins",
-            _ => "Draw",
+            "1-0" => format!("{white} wins, White wins"),
+            "0-1" => format!("{black} wins, Black wins"),
+            _ => "Draw".to_string(),
         };
         println!(
             "Finished game {done} of {} ({white} vs {black}): {} {{{how} by {}}}",
