@@ -55,7 +55,7 @@ use std::sync::Arc;
 
 use peaduck_core::encoding::{encode_game, legal_actions, OBS_SIZE};
 use peaduck_core::rng::Rng;
-use peaduck_core::{Color, Game, GameResult, Move};
+use peaduck_core::{Color, DuckDefence, Game, GameResult, Move, Position};
 use rayon::prelude::*;
 
 use crate::record::{GameRecord, PlyRecord, Termination, TERMINATIONS};
@@ -457,14 +457,36 @@ fn interior_action(node: &Node, cfg: &GumbelConfig) -> usize {
         .unwrap()
 }
 
+/// The steps the search considers in `pos`: every legal step, except in a
+/// duck step where only some duck squares stop the opponent from capturing
+/// our king next ([`Position::duck_defence`]): then only those. The others
+/// lose at once, so they get no visits and a policy target of 0. (Not when
+/// the fifty-move rule ends the game first.)
+fn search_actions(pos: &Position) -> Vec<(usize, Move)> {
+    let mut actions = legal_actions(pos);
+    if pos.halfmove_clock() < 100 {
+        if let DuckDefence::Block(safe) = pos.duck_defence() {
+            actions.retain(|(_, m)| safe.contains(m.to()));
+        }
+    }
+    actions
+}
+
 /// Exact value of a leaf for its side to move, or None if the game goes
 /// on. (After a king capture the side to move is still the capturer, who
 /// won.) A leaf where the side to move can capture the king is a win too:
-/// that capture is its next step.
+/// that capture is its next step. A duck step where no duck square saves
+/// the king is a loss for the same reason, one step earlier.
 fn terminal_value(game: &Game) -> Option<f32> {
-    let stm: Color = game.position().side_to_move();
+    let pos = game.position();
+    let stm: Color = pos.side_to_move();
     match game.result() {
-        GameResult::Ongoing if game.position().king_capture_available() => Some(1.0),
+        GameResult::Ongoing if pos.king_capture_available() => Some(1.0),
+        GameResult::Ongoing
+            if pos.halfmove_clock() < 100 && pos.duck_defence() == DuckDefence::Lost =>
+        {
+            Some(-1.0)
+        }
         GameResult::Ongoing => None,
         GameResult::Win(c, _) => Some(if c == stm { 1.0 } else { -1.0 }),
         GameResult::Draw(_) => Some(0.0),
@@ -504,7 +526,7 @@ pub(crate) struct Outcome {
 impl Slot {
     /// A slot that starts searching from `game` (evaluation games, puzzles).
     pub(crate) fn with_game(game: Game, rng: Rng) -> Slot {
-        let eval_actions = legal_actions(game.position());
+        let eval_actions = search_actions(game.position());
         Slot {
             eval_game: game.clone(),
             game,
@@ -523,7 +545,7 @@ impl Slot {
         self.nodes.clear();
         self.simulations_done = 0;
         self.eval_game = self.game.clone();
-        self.eval_actions = legal_actions(self.game.position());
+        self.eval_actions = search_actions(self.game.position());
         self.request = Request::Root;
     }
 
@@ -599,7 +621,7 @@ impl Slot {
                 self.simulations_done += 1;
                 continue;
             }
-            self.eval_actions = legal_actions(leaf.position());
+            self.eval_actions = search_actions(leaf.position());
             self.eval_game = leaf;
             self.request = Request::Leaf { path };
             return false;
@@ -1036,9 +1058,31 @@ mod tests {
         let (mv, p) = search_step(fen, 256, 64);
         assert!(mv.is_duck());
         assert!(["b4", "c3", "d2"].contains(&mv.to_uci().as_str()), "{mv}");
+        // only the three blocking squares are searched and get a target
+        assert_eq!(p.targets.len(), 3);
         // value sign: White (queen down, but safe) is worse but not lost
         let [w, _, l] = p.value_wdl().unwrap();
         assert!(w - l < 0.0 && w - l > -0.9, "search value {w} {l}");
+    }
+
+    #[test]
+    fn unsavable_duck_step_is_a_loss() {
+        peaduck_core::init();
+        // White walked into the knight on d3: no duck square saves the king
+        let lost = Game::from_fen("4k3/8/8/8/8/3n4/5K2/8 w - - 0 1 duck").unwrap();
+        assert_eq!(terminal_value(&lost), Some(-1.0));
+        // ... unless the fifty-move rule ends the game first
+        let drawn = Game::from_fen("4k3/8/8/8/8/3n4/5K2/8 w - - 100 80 duck").unwrap();
+        assert_eq!(terminal_value(&drawn), None);
+        assert_eq!(
+            search_actions(drawn.position()).len(),
+            legal_actions(drawn.position()).len()
+        );
+        // every king move walks into a knight: the search sees each one lost
+        let fen = "4k3/8/8/8/8/2nn4/8/K7 w - - 0 1";
+        let (_, p) = search_step(fen, 32, 4);
+        let [w, _, l] = p.value_wdl().unwrap();
+        assert!(w - l < -0.9, "search value {w} {l}");
     }
 
     #[test]

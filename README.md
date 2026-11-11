@@ -56,6 +56,12 @@ changes after the duck step. Everything is built on that:
   move can capture the king is scored as a win straight away (that capture
   is its next step). It works like mate detection one step early, and the
   search finds duck blocks and king safety much faster with it.
+* **Duck evasions:** one step earlier, in the duck step, the search checks
+  which duck squares stop the opponent from capturing the king next
+  (`Position::duck_defence`). If none does (a knight, pawn or king attack,
+  or two lines with no shared square), the position is scored as lost at
+  once; if only some do, only those are searched. In self-play the other
+  squares get a policy target of 0.
 
 ## Build and use
 
