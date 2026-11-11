@@ -195,6 +195,15 @@ def resolve_settings(args):
     """Fill unset settings from the run's config.json (--resume) or the
     defaults, store the result in config.json and print it."""
     config_path = os.path.join(args.run, "config.json")
+    ckpt = os.path.join(args.run, "checkpoint.pt")
+    if not args.resume and os.path.exists(ckpt):
+        try:
+            gen = torch.load(ckpt, map_location="cpu", weights_only=False).get("generation", "?")
+        except Exception:
+            gen = "?"
+        sys.exit(f"{args.run} already holds a run (checkpoint at generation {gen}).\n"
+                 f"  continue it:     python train.py --run {args.run} --resume\n"
+                 f"  or start fresh:  use another --run folder (or delete this one)")
     saved = {}
     if args.resume and os.path.exists(config_path):
         with open(config_path) as f:

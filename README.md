@@ -118,6 +118,20 @@ python tools\sprt.py --list                     # history of all tests
 * `--dev-net` / `--base-net` give each side another network; `--evalfile`
   embeds one network in both builds.
 
+## Tuning search parameters: SPSA
+
+```powershell
+python tools\spsa.py --name cpuct --params CPuct,CPuctExponent,FpuReduction,FpuReductionRoot `
+    --net runs\big\nets\gen_0200.pdn --tc 8+0.08 --games 20000 --concurrency 7
+python tools\spsa.py --name cpuct          # continue after Ctrl+C
+python tools\spsa.py --name cpuct --show   # current values
+```
+
+OpenBench's SPSA method (same step-size formulas, `c_end`/`r_end` from the
+engine's `spsa` command), with the games played by duckmatch. `--config
+FILE` takes parameter lines in OpenBench format instead of `--params`.
+State and history are kept in `.spsa/`.
+
 ## Testing changes: duckmatch
 
 ```powershell
