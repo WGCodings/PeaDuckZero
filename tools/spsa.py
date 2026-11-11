@@ -6,6 +6,7 @@ with games played by duckmatch.
         --net runs\\big\\nets\\gen_0200.pdn --tc 8+0.08 --games 20000 --concurrency 7
     python tools\\spsa.py --name cpuct                 # continue a stopped tune (same settings)
     python tools\\spsa.py --name cpuct --show          # current values, in OpenBench format
+    python tools\\spsa.py --dashboard                   # all tunes in the browser, live
 
 Parameters: the engine's `spsa` command lists every tunable one in
 OpenBench's format (name, int, value, min, max, c_end, r_end). --params picks
@@ -95,6 +96,7 @@ def new_state(args):
 
 
 def save(state):
+    state["updated"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     path = os.path.join(SPSA_DIR, f"{state['name']}.json")
     with open(path + ".tmp", "w") as f:
         json.dump(state, f, indent=1)
@@ -144,7 +146,7 @@ def run_batch(state, duckmatch, plus, minus, seed):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--name", required=True, help="name of the tune (state in .spsa/<name>.json)")
+    ap.add_argument("--name", help="name of the tune (state in .spsa/<name>.json)")
     ap.add_argument("--params", help="comma-separated parameter names (default: all of them)")
     ap.add_argument("--config", help="file with parameter lines in OpenBench format instead of --params")
     ap.add_argument("--engine", default=os.path.join(REPO, "target", "release", f"peaduckzero{EXE}"),
@@ -158,7 +160,16 @@ def main():
     ap.add_argument("--hash", type=int, default=16)
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--show", action="store_true", help="print the tune's current values and exit")
+    ap.add_argument("--dashboard", action="store_true",
+                    help="serve the tune dashboard (http://localhost:8767) and exit with Ctrl+C")
+    ap.add_argument("--port", type=int, default=8767, help="dashboard port")
+    ap.add_argument("--no-browser", action="store_true", help="don't open the dashboard in a browser")
     args = ap.parse_args()
+    if args.dashboard:
+        serve_dashboard(args.port, not args.no_browser)
+        return
+    if not args.name:
+        ap.error("--name is required")
 
     os.makedirs(SPSA_DIR, exist_ok=True)
     path = os.path.join(SPSA_DIR, f"{args.name}.json")
@@ -219,6 +230,74 @@ def main():
     except KeyboardInterrupt:
         print(f"\nstopped; continue with: python tools/spsa.py --name {args.name}")
     show(state)
+
+
+# ---------------------------------------------------------------------- dashboard
+
+def load_tunes():
+    """Every tune in .spsa: its state plus the parameter history from the CSV."""
+    tunes = []
+    if not os.path.isdir(SPSA_DIR):
+        return tunes
+    for f in sorted(os.listdir(SPSA_DIR)):
+        if not f.endswith(".json"):
+            continue
+        try:
+            state = json.load(open(os.path.join(SPSA_DIR, f)))
+        except (OSError, ValueError):
+            continue  # being written
+        history = []
+        csv_path = os.path.join(SPSA_DIR, f[:-5] + ".csv")
+        if os.path.exists(csv_path):
+            with open(csv_path, newline="") as fh:
+                rows = list(csv.reader(fh))
+            if rows:
+                head = rows[0]
+                for r in rows[1:]:
+                    if len(r) == len(head):
+                        history.append({k: float(v) for k, v in zip(head, r)})
+        state["history"] = history
+        state.setdefault("updated", datetime.datetime.fromtimestamp(
+            os.path.getmtime(os.path.join(SPSA_DIR, f))).strftime("%Y-%m-%d %H:%M:%S"))
+        tunes.append(state)
+    tunes.sort(key=lambda t: t.get("updated", ""), reverse=True)
+    return tunes
+
+
+def serve_dashboard(port, open_browser):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import webbrowser
+
+    page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spsa_dashboard.html")
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, body, ctype):
+            body = body.encode() if isinstance(body, str) else body
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.startswith("/api/tunes"):
+                self.reply(json.dumps(load_tunes()), "application/json")
+            else:
+                self.reply(open(page, "rb").read(), "text/html; charset=utf-8")
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), H)
+    url = f"http://localhost:{port}"
+    print(f"SPSA dashboard: {url}  (Ctrl+C to stop)")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

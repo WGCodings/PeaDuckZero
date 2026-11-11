@@ -138,6 +138,7 @@ python tools\spsa.py --name cpuct --params CPuct,CPuctExponent,FpuReduction,FpuR
     --net runs\big\nets\gen_0200.pdn --tc 8+0.08 --games 20000 --concurrency 7
 python tools\spsa.py --name cpuct          # continue after Ctrl+C
 python tools\spsa.py --name cpuct --show   # current values
+python tools\spsa.py --dashboard            # every tune in the browser, live (http://localhost:8767)
 ```
 
 OpenBench's SPSA method (same step-size formulas, `c_end`/`r_end` from the
