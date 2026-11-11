@@ -30,7 +30,11 @@
 //! prior mass) in the tree, minus 1.0 · √(...) at the root; policy
 //! temperature 1.61. The original search (constant cpuct 1.5, unvisited
 //! children at Q = 0, temperature 1) is CPuct 150, CPuctFactor 0, all FPU
-//! values 0, both temperatures 100.
+//! values 0, all temperatures 100 (and CPuctDuck 150).
+//!
+//! Duck steps (nodes whose children are duck squares) use CPuctDuck,
+//! FpuReductionDuck and PolicyTempDuck in place of CPuct, FpuReduction and
+//! PolicyTemp; by default they have the same values.
 //!
 //! The non-standard UCI command `spsa` prints the *current* values (after
 //! any `setoption`) in OpenBench's SPSA input format
@@ -112,6 +116,14 @@ tunables! {
     "PolicyTemp" => policy_temp: default 162, min 25, max 800, scale 100, step 3;
     /// Softmax temperature of the policy priors at the root.
     "PolicyTempRoot" => policy_temp_root: default 212, min 25, max 2000, scale 100, step 3;
+    /// Duck steps (a node whose children are duck squares) have their own
+    /// cpuct (in place of CPuct; CPuctFactor, CPuctBase, the exponent and
+    /// the gini scaling are shared), FPU reduction (in place of
+    /// FpuReduction) and policy temperature (in place of PolicyTemp). The
+    /// root keeps its ...Root values. Defaults: the move-step values.
+    "CPuctDuck" => cpuct_duck: default 139, min 1, max 1000, scale 100, step 1;
+    "FpuReductionDuck" => fpu_reduction_duck: default 43, min 0, max 400, scale 100, step 2;
+    "PolicyTempDuck" => policy_temp_duck: default 162, min 25, max 800, scale 100, step 3;
     /// Final move choice: among the root moves with at least
     /// BestMoveMinShare of the most visited move's visits, the one with the
     /// highest Q − BestMoveLcbC / √visits (a lower confidence bound: a move
@@ -170,17 +182,27 @@ impl SearchParams {
         (visits, pv, factor)
     }
 
-    /// cpuct for a node with `visits` visits (without the gini scaling).
+    /// cpuct for a move-step node with `visits` visits (without the gini
+    /// scaling).
+    #[cfg(test)]
     pub fn cpuct_at(&self, visits: u32) -> f32 {
-        self.cpuct + self.cpuct_factor * ((visits as f32 + self.cpuct_base) / self.cpuct_base).ln()
+        self.cpuct_from(self.cpuct, visits)
+    }
+
+    fn cpuct_from(&self, base: f32, visits: u32) -> f32 {
+        base + self.cpuct_factor * ((visits as f32 + self.cpuct_base) / self.cpuct_base).ln()
     }
 
     /// Exploration coefficient of a node: U = this · P / (1 + n).
-    /// `gini` = 1 − Σ prior² of its children.
-    pub fn explore_coef(&self, visits: u32, gini: f32) -> f32 {
+    /// `gini` = 1 − Σ prior² of its children; `duck`: the node is a duck
+    /// step (CPuctDuck in place of CPuct).
+    pub fn explore_coef(&self, visits: u32, gini: f32, duck: bool) -> f32 {
         let gini_scale = (self.cpuct_gini_base - self.cpuct_gini_factor * (gini + 0.001).ln())
             .clamp(0.0, self.cpuct_gini_max);
-        self.cpuct_at(visits) * gini_scale * (visits.max(1) as f32).powf(self.cpuct_exponent)
+        let base = if duck { self.cpuct_duck } else { self.cpuct };
+        self.cpuct_from(base, visits)
+            * gini_scale
+            * (visits.max(1) as f32).powf(self.cpuct_exponent)
     }
 }
 
@@ -239,7 +261,7 @@ mod tests {
         // cpuct(N) · √N, independent of the policy's shape (gini off)
         for (n, gini) in [(1u32, 0.0f32), (400, 0.3), (10_000, 0.9)] {
             let want = p.cpuct_at(n) * (n as f32).sqrt();
-            assert!((p.explore_coef(n, gini) - want).abs() < 1e-3 * want);
+            assert!((p.explore_coef(n, gini, false) - want).abs() < 1e-3 * want);
         }
         // the log term is ~0 at small N and grows with N
         assert!((p.cpuct_at(0) - p.cpuct).abs() < 1e-6);
@@ -257,9 +279,14 @@ mod tests {
             ("FpuReductionRoot", "0"),
             ("PolicyTemp", "100"),
             ("PolicyTempRoot", "100"),
+            ("CPuctDuck", "150"),
+            ("FpuReductionDuck", "0"),
+            ("PolicyTempDuck", "100"),
         ]);
-        assert!((p.explore_coef(400, 0.5) - 1.5 * 20.0).abs() < 1e-4);
+        assert!((p.explore_coef(400, 0.5, false) - 1.5 * 20.0).abs() < 1e-4);
+        assert!((p.explore_coef(400, 0.5, true) - 1.5 * 20.0).abs() < 1e-4);
         assert_eq!(p.policy_temp, 1.0);
+        assert_eq!(p.policy_temp_duck, 1.0);
     }
 
     #[test]
@@ -272,15 +299,15 @@ mod tests {
             ("CPuctGiniFactor", "163"),
             ("CPuctGiniMax", "210"),
         ]);
-        assert!(g.explore_coef(100, 0.1) > g.explore_coef(100, 0.8));
-        assert!((g.explore_coef(100, 0.0) - 2.15 * 2.1 * 10.0).abs() < 1e-3);
+        assert!(g.explore_coef(100, 0.1, false) > g.explore_coef(100, 0.8, false));
+        assert!((g.explore_coef(100, 0.0, false) - 2.15 * 2.1 * 10.0).abs() < 1e-3);
         // exponent: N^0.84 instead of √N
         let e = with(&[
             ("CPuct", "215"),
             ("CPuctFactor", "0"),
             ("CPuctExponent", "84"),
         ]);
-        assert!((e.explore_coef(1000, 0.5) - 2.15 * 1000f32.powf(0.84)).abs() < 1e-2);
+        assert!((e.explore_coef(1000, 0.5, false) - 2.15 * 1000f32.powf(0.84)).abs() < 1e-2);
     }
 
     #[test]

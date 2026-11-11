@@ -62,6 +62,13 @@ changes after the duck step. Everything is built on that:
   or two lines with no shared square), the position is scored as lost at
   once; if only some do, only those are searched. In self-play the other
   squares get a policy target of 0.
+* **Solver (engine):** these exact results are passed up the tree. A node
+  is proven won when one of its steps wins, and proven lost when all of
+  them lose. The engine plays a proven win at once, stops searching, and
+  avoids proven losses while another move is left.
+* **Duck-step parameters:** `CPuctDuck`, `FpuReductionDuck` and
+  `PolicyTempDuck` replace `CPuct`, `FpuReduction` and `PolicyTemp` at duck
+  steps (same defaults, separate for SPSA).
 
 ## Build and use
 

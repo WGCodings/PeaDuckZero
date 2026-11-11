@@ -19,7 +19,9 @@
 //! * first-play urgency: an unvisited child is scored as a weighted parent
 //!   Q minus a reduction that grows with the policy mass already visited,
 //!   with separate settings at the root;
-//! * policy softmax temperature, separate at the root.
+//! * policy softmax temperature, separate at the root;
+//! * duck steps (nodes whose children are duck squares) have their own
+//!   cpuct, FPU reduction and policy temperature.
 //!
 //! The original search (cpuct 1.5, unvisited children at Q = 0,
 //! temperature 1) is still reachable through the options.
@@ -61,7 +63,19 @@
 //! search), so the threads explore a little differently. With one thread
 //! nothing of this changes the search (no virtual loss, same results).
 //!
-//! Not (yet): proven-result propagation, smart pruning.
+//! Solver: exact results are passed up the tree. A node is proven won when
+//! one of its steps is proven to win for its side to move, and proven lost
+//! when every step is proven to lose (each needs a visit first). A proven
+//! node is marked like a finished game (`TERMINAL_WIN`/`TERMINAL_LOSS`; it
+//! keeps its children), so playouts stop there and back up the exact
+//! result. Selection skips steps proven to lose while another is left; the
+//! root is never marked: there a proven win is played (the search stops at
+//! once) and proven losses are avoided while anything else is left. Only
+//! wins and losses are proven, not draws (a repetition draw depends on the
+//! path). Leaves proven so far: king captured, king capture available, no
+//! legal move, and duck steps where no duck square saves the king.
+//!
+//! Not (yet): smart pruning.
 //!
 //! Each node stores W/L for the side that made the step into it (the side
 //! to move at its parent); the root, which has no such step, stores them as
@@ -310,6 +324,67 @@ fn turn_change(a: &Arena, node: usize, root_turn_change: bool) -> bool {
     }
 }
 
+/// Is `node`'s position a duck step (its children are duck squares)?
+fn duck_node(a: &Arena, node: usize, root_turn_change: bool) -> bool {
+    if node == ROOT {
+        !root_turn_change
+    } else {
+        !a[node].mv().is_duck()
+    }
+}
+
+/// A proven result for the side to move at a node's parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Proof {
+    Win,
+    Loss,
+}
+
+/// The proven result of the step into `c` (not the root), for the side to
+/// move at its parent, if there is one.
+fn proof(a: &Arena, c: usize) -> Option<Proof> {
+    let f = a[c].flags.load(Relaxed);
+    let (win, loss) = (f & TERMINAL_WIN != 0, f & TERMINAL_LOSS != 0);
+    if !win && !loss {
+        return None;
+    }
+    // the side to move at `c` is the parent's, except after a duck move
+    if win != a[c].mv().is_duck() {
+        Some(Proof::Win)
+    } else {
+        Some(Proof::Loss)
+    }
+}
+
+/// Try to prove the expanded node `node` (not the root) from its children:
+/// won if a step wins, lost if every step loses. Marks it and returns true
+/// if it is proven (also if it already was).
+fn prove(a: &Arena, node: usize) -> bool {
+    let n = &a[node];
+    let f = n.flags.load(Relaxed);
+    if f & (TERMINAL_WIN | TERMINAL_LOSS) != 0 {
+        return true;
+    }
+    if f & TERMINAL != 0 || !n.expanded() || n.count() == 0 {
+        return false;
+    }
+    let mut all_lost = true;
+    for c in n.children() {
+        match proof(a, c) {
+            Some(Proof::Win) => {
+                n.flags.fetch_or(TERMINAL_WIN, Relaxed);
+                return true;
+            }
+            Some(Proof::Loss) => {}
+            None => all_lost = false,
+        }
+    }
+    if all_lost {
+        n.flags.fetch_or(TERMINAL_LOSS, Relaxed);
+    }
+    all_lost
+}
+
 /// Priors from raw logits: softmax(logit / temp) over the legal moves.
 fn priors(moves: &[(Move, f32)], temp: f32) -> Vec<(Move, f32)> {
     let inv_t = 1.0 / temp.max(1e-3);
@@ -489,6 +564,10 @@ impl View<'_> {
         turn_change(self.a, node, self.root_turn_change)
     }
 
+    fn duck_node(&self, node: usize) -> bool {
+        duck_node(self.a, node, self.root_turn_change)
+    }
+
     /// (FPU, gini) of `node`. FPU: value of an unvisited child, from the
     /// view of the side to move at `node`: the parent's own Q minus the FPU
     /// reduction times √(policy mass of the children already visited).
@@ -507,6 +586,8 @@ impl View<'_> {
         let p = &self.params;
         let (weight, reduction) = if node == ROOT {
             (p.fpu_parent_weight_root, p.fpu_reduction_root)
+        } else if self.duck_node(node) {
+            (p.fpu_parent_weight, p.fpu_reduction_duck)
         } else {
             (p.fpu_parent_weight, p.fpu_reduction)
         };
@@ -526,17 +607,28 @@ impl View<'_> {
         self.fpu_and_gini(node).0
     }
 
+    /// The child to search next: PUCT, except that a step proven to win is
+    /// taken at once and steps proven to lose only while nothing else is
+    /// left.
     fn select(&self, node: usize) -> usize {
         let n = &self.a[node];
         let (fpu, gini) = self.fpu_and_gini(node);
-        let u = self.params.explore_coef(n.visits(), gini) * self.cpuct_scale;
+        let u = self
+            .params
+            .explore_coef(n.visits(), gini, self.duck_node(node))
+            * self.cpuct_scale;
         let children = n.children();
         let mut best = (children.start, f32::NEG_INFINITY);
         for c in children {
             let child = &self.a[c];
+            let lost = match proof(self.a, c) {
+                Some(Proof::Win) => return c,
+                Some(Proof::Loss) => 1e6,
+                None => 0.0,
+            };
             let visits = child.visits();
             let q = if visits == 0 { fpu } else { child.q() };
-            let score = q + u * child.prior() / (1.0 + visits as f32);
+            let score = q + u * child.prior() / (1.0 + visits as f32) - lost;
             if score > best.1 {
                 best = (c, score);
             }
@@ -553,13 +645,70 @@ impl View<'_> {
         })
     }
 
-    /// The move to play: among the root moves with at least
+    /// The step to follow from `node` (PV, duck square): one proven to win,
+    /// else the most visited one not proven to lose, else the most visited.
+    fn best_step(&self, node: usize) -> Option<usize> {
+        let children = self.a[node].children();
+        if let Some(w) = children
+            .clone()
+            .find(|&c| proof(self.a, c) == Some(Proof::Win))
+        {
+            return Some(w);
+        }
+        self.most_visited(
+            children
+                .clone()
+                .filter(|&c| proof(self.a, c) != Some(Proof::Loss)),
+        )
+        .or_else(|| self.best_child(node))
+    }
+
+    fn most_visited(&self, nodes: impl Iterator<Item = usize>) -> Option<usize> {
+        nodes.max_by(|&a, &b| {
+            let (a, b) = (&self.a[a], &self.a[b]);
+            a.visits()
+                .cmp(&b.visits())
+                .then(a.prior().total_cmp(&b.prior()))
+        })
+    }
+
+    /// Root moves not proven to lose.
+    fn live_root_moves(&self) -> impl Iterator<Item = usize> + '_ {
+        self.a[ROOT]
+            .children()
+            .filter(|&c| proof(self.a, c) != Some(Proof::Loss))
+    }
+
+    /// The root's result is known: a move is proven to win, or every move
+    /// is proven to lose.
+    fn root_decided(&self) -> bool {
+        let root = &self.a[ROOT];
+        root.count() > 0
+            && (root
+                .children()
+                .any(|c| proof(self.a, c) == Some(Proof::Win))
+                || self.live_root_moves().next().is_none())
+    }
+
+    /// The move to play: a move proven to win if there is one; otherwise,
+    /// leaving out moves proven to lose (unless all are), among the root
+    /// moves with at least
     /// `BestMoveMinShare` of the most visited move's visits, the highest
     /// lower confidence bound Q − `BestMoveLcbC` / √visits (ties: more
     /// visits). A move with fewer visits is chosen only if its Q is
     /// clearly better.
     fn root_choice(&self) -> Option<usize> {
-        let most = self.best_child(ROOT)?;
+        let root = self.a[ROOT].children();
+        if let Some(w) = self.most_visited(
+            root.clone()
+                .filter(|&c| proof(self.a, c) == Some(Proof::Win)),
+        ) {
+            return Some(w);
+        }
+        let live: Vec<usize> = self.live_root_moves().collect();
+        let Some(most) = self.most_visited(live.iter().copied()) else {
+            return self.best_child(ROOT);
+        };
         let max_visits = self.a[most].visits();
         if max_visits == 0 {
             return Some(most);
@@ -570,8 +719,8 @@ impl View<'_> {
             let n = &self.a[c];
             n.q() - p.best_move_lcb_c / (n.visits() as f32).sqrt()
         };
-        self.a[ROOT]
-            .children()
+        live.iter()
+            .copied()
             .filter(|&c| self.a[c].visits() >= min_visits)
             .max_by(|&a, &b| {
                 lcb(a)
@@ -590,7 +739,7 @@ impl View<'_> {
                 break;
             }
             pv.push(self.a[c].mv());
-            next = self.best_child(c);
+            next = self.best_step(c);
         }
         pv
     }
@@ -644,22 +793,23 @@ impl View<'_> {
         if budget.fixed {
             return elapsed >= budget.soft;
         }
-        let root = &self.a[ROOT];
-        if root.count() == 1 {
-            return self.a[root.children().start].visits() >= SINGLE_MOVE_VISITS;
+        // a single legal move, or a single move not proven to lose
+        let mut live = self.live_root_moves();
+        if let (Some(only), None) = (live.next(), live.next()) {
+            return self.a[only].visits() >= SINGLE_MOVE_VISITS;
         }
         elapsed.as_secs_f32() >= budget.soft.as_secs_f32() * self.time_factor().2
     }
 
-    /// The duck square to play after the root move `child`: its most
-    /// visited duck move (None if it has no visited children, e.g. a king
-    /// capture).
+    /// The duck square to play after the root move `child`: one proven to
+    /// win, else its most visited duck move not proven to lose (None if it
+    /// has no children, e.g. a king capture).
     fn duck_after(&self, child: usize) -> Option<Square> {
         let n = &self.a[child];
-        if !n.expanded() || n.terminal().is_some() {
+        if !n.expanded() || n.count() == 0 {
             return None;
         }
-        self.best_child(child)
+        self.best_step(child)
             .filter(|&c| self.a[c].mv().is_duck())
             .map(|c| self.a[c].mv().to())
     }
@@ -787,6 +937,14 @@ impl Shared<'_> {
                 n.add_wl(v[0], v[2]);
             }
         }
+        // solver: a won or lost leaf may prove its parents (not the root)
+        if a[node].flags.load(Relaxed) & (TERMINAL_WIN | TERMINAL_LOSS) != 0 {
+            for &i in path[..path.len() - 1].iter().rev() {
+                if i == ROOT || !prove(a, i) {
+                    break;
+                }
+            }
+        }
         if full {
             Playout::Full
         } else {
@@ -869,6 +1027,8 @@ impl Shared<'_> {
         };
         let temp = if node == ROOT {
             self.params.policy_temp_root
+        } else if pos.is_duck_step() {
+            self.params.policy_temp_duck
         } else {
             self.params.policy_temp
         };
@@ -941,7 +1101,12 @@ impl Shared<'_> {
         let Some(best) = view.root_choice() else {
             return;
         };
-        let wdl = guard[best].mean_wdl();
+        // a proven result is shown as a certain win or loss
+        let wdl = match proof(&guard, best) {
+            Some(Proof::Win) => [1.0, 0.0, 0.0],
+            Some(Proof::Loss) => [0.0, 0.0, 1.0],
+            None => guard[best].mean_wdl(),
+        };
         let playouts = self.playouts.load(Relaxed);
         let wdl_str = if show_wdl {
             wdl_string(wdl)
@@ -1011,11 +1176,12 @@ impl Mcts {
                     compact_in_place(a, node, None);
                     a[ROOT].mv.store(Move::NULL.raw(), Relaxed);
                     let p = ctx.params;
-                    retemper(
-                        &a.nodes[a[ROOT].children()],
-                        p.policy_temp,
-                        p.policy_temp_root,
-                    );
+                    let t_tree = if game.position().is_duck_step() {
+                        p.policy_temp_duck
+                    } else {
+                        p.policy_temp
+                    };
+                    retemper(&a.nodes[a[ROOT].children()], t_tree, p.policy_temp_root);
                 }
                 a[ROOT].visits()
             }
@@ -1043,12 +1209,14 @@ impl Mcts {
         for &m in &game.moves()[saved.game.moves().len()..] {
             node = a[node].children().find(|&c| a[c].mv() == m)?;
         }
-        // the new root must be an expanded, non-terminal position (a node
-        // marked as a draw by repetition is not a draw at the root)
+        // the new root must be an expanded position (a finished game, or a
+        // node marked as a draw by repetition, which is not a draw at the
+        // root, never is); a proof is dropped: the root is never marked
         let n = &a[node];
-        if !n.expanded() || n.terminal().is_some() || n.count() == 0 {
+        if !n.expanded() || n.count() == 0 {
             return None;
         }
+        n.flags.fetch_and(!(TERMINAL_WIN | TERMINAL_LOSS), Relaxed);
         Some(node)
     }
 
@@ -1261,6 +1429,7 @@ fn search_tree(
                     && a[ROOT].count() > 0
                     && target_depth.is_none_or(|d| shared.depth() < d)
                     && !ctx.stop.load(Relaxed)
+                    && (limits.infinite || !view.root_decided())
                     && budget.is_none_or(|b| !view.time_up(&b, start.elapsed()))
             };
             if !go_on {
@@ -1477,16 +1646,142 @@ mod tests {
         m.search(&mut net, &g, &ctx);
         assert_eq!(m.arena[ROOT].count(), 3);
 
-        // Kf2 walks into the knight on d3: its duck step is lost at once
+        // every king move walks into a knight (c3 covers a2 and b1, d3
+        // covers b2): each duck step after it is lost without the network,
+        // whichever moves the policy sends the playouts to
+        let g = Game::from_fen("4k3/8/8/8/8/2nn4/8/K7 w - - 0 1").unwrap();
+        let mut m = Mcts::default();
+        m.search(&mut net, &g, &ctx);
+        let a = &m.arena;
+        let visited: Vec<usize> = a[ROOT].children().filter(|&i| a[i].visits() > 0).collect();
+        assert!(!visited.is_empty());
+        for i in visited {
+            assert_eq!(a[i].terminal(), Some([0.0, 0.0, 1.0]), "{}", a[i].mv());
+            assert_eq!(a[i].count(), 0);
+        }
+    }
+
+    #[test]
+    fn solver_proves_wins_and_losses_from_children() {
+        peaduck_core::init();
+        let sq = |s: &str| Square::parse(s).unwrap();
+        let mv = |f: &str, t: &str| Move::new(sq(f), sq(t), Move::QUIET);
+        let node = |m: Move, first: u32, count: u8, flags: u8, visits: u32| NodeData {
+            mv: m,
+            first,
+            count,
+            flags,
+            visits,
+            prior: 0.5,
+            ..Default::default()
+        };
+        // root (move step): A = 1 and B = 2; after A the duck squares 3, 4,
+        // after B the duck squares 5, 6
+        let mut data = vec![
+            node(Move::NULL, 1, 2, EXPANDED, 10),
+            node(mv("e2", "e4"), 3, 2, EXPANDED, 5),
+            node(mv("d2", "d4"), 5, 2, EXPANDED, 4),
+            // the opponent, to move after this duck square, has lost
+            node(Move::duck(sq("a3")), 0, 0, TERMINAL_LOSS, 1),
+            node(Move::duck(sq("a4")), 0, 0, 0, 3),
+            // the opponent wins after both duck squares (king capture)
+            node(Move::duck(sq("a5")), 0, 0, TERMINAL_WIN, 2),
+            node(Move::duck(sq("a6")), 0, 0, 0, 1),
+        ];
+        let a = Arena::from_data(&data, 16);
+        assert!(prove(&a, 1), "a duck square that wins proves A won");
+        assert_eq!(proof(&a, 1), Some(Proof::Win));
+        assert!(!prove(&a, 2), "a5 loses, a6 is still open");
+        assert_eq!(proof(&a, 2), None);
+
+        data[6].flags = TERMINAL_WIN;
+        let a = Arena::from_data(&data, 16);
+        assert!(prove(&a, 2), "every duck square loses: B is lost");
+        assert_eq!(proof(&a, 2), Some(Proof::Loss));
+        assert!(prove(&a, 1));
+        let view = View {
+            a: &a,
+            params: SearchParams::default(),
+            cpuct_scale: 1.0,
+            root_turn_change: true,
+        };
+        // the proven win is played, with its winning duck square
+        assert!(view.root_decided());
+        assert_eq!(view.root_choice(), Some(1));
+        assert_eq!(view.duck_after(1), Some(sq("a3")));
+        assert_eq!(view.select(ROOT), 1);
+        // without the win, B (lost) is avoided even with more visits
+        let mut data2 = data.clone();
+        data2[3].flags = 0;
+        data2[2].flags = EXPANDED;
+        data2[2].visits = 9;
+        let a = Arena::from_data(&data2, 16);
+        assert!(prove(&a, 2));
+        assert!(!prove(&a, 1));
+        let view = View { a: &a, ..view };
+        assert!(!view.root_decided());
+        assert_eq!(view.root_choice(), Some(1));
+        assert_eq!(view.select(ROOT), 1);
+        assert_eq!(view.duck_after(2), Some(sq("a5")));
+    }
+
+    #[test]
+    fn solver_stops_the_search_once_the_root_is_decided() {
+        peaduck_core::init();
+        let mut net = PolicyNet::embedded();
+        let limits = SearchLimits {
+            nodes: Some(5000),
+            ..Default::default()
+        };
+        let common = CommonOptions::default();
+        let stop = AtomicBool::new(false);
+        let params = SearchParams::default();
+        let ctx = ctx_for(&limits, &common, &stop, &params);
+        // a king capture is a proven win: played at once
+        let g = Game::from_fen("4k3/8/8/8/8/8/8/4R1K1 w - - 0 1").unwrap();
+        let (r, playouts) = super::run(&mut net, &g, &ctx, false);
+        assert_eq!(r.best, g.position().parse_move("e1e8").unwrap());
+        assert!(playouts < 100, "{playouts}");
+        // every king move walks into a knight: all proven lost, still a move
+        let g = Game::from_fen("4k3/8/8/8/8/2nn4/8/K7 w - - 0 1").unwrap();
+        let (r, playouts) = super::run(&mut net, &g, &ctx, false);
+        assert!(g.position().legal_moves().contains(&r.best));
+        assert!(playouts < 100, "{playouts}");
+        // Kf2 walks into the knight on d3 (proven lost), Kd1, Kd2, Ke2 and
+        // Kf1 are safe: the lost move is never chosen
         let g = Game::from_fen("4k3/8/8/8/8/3n4/8/4K3 w - - 0 1").unwrap();
+        let (r, _) = super::run(&mut net, &g, &ctx, false);
+        assert_ne!(r.best, g.position().parse_move("e1f2").unwrap());
+    }
+
+    #[test]
+    fn solver_proves_a_win_a_turn_deep() {
+        peaduck_core::init();
+        let mut net = PolicyNet::embedded();
+        let limits = SearchLimits {
+            nodes: Some(30000),
+            ..Default::default()
+        };
+        let common = CommonOptions::default();
+        let stop = AtomicBool::new(false);
+        let params = SearchParams::default();
+        let ctx = ctx_for(&limits, &common, &stop, &params);
+        // Bxc6 with the duck on d7: the bishop attacks the king on e8 and
+        // the duck closes the only escape, so every Black turn loses
+        let g = Game::from_fen("1rbqkb1r/p1p1pppp/n2p*n2/1p6/7N/3P2P1/PPPKPPBP/RNBQ3R w k - 0 7")
+            .unwrap();
         let mut m = Mcts::default();
         let r = m.search(&mut net, &g, &ctx);
-        let kf2 = g.position().parse_move("e1f2").unwrap();
-        assert_ne!(r.best, kf2);
         let a = &m.arena;
-        let child = a[ROOT].children().find(|&i| a[i].mv() == kf2).unwrap();
-        assert_eq!(a[child].terminal(), Some([0.0, 0.0, 1.0]));
-        assert_eq!(a[child].count(), 0);
+        let best = a[ROOT].children().find(|&c| a[c].mv() == r.best).unwrap();
+        assert_eq!(proof(a, best), Some(Proof::Win), "{}", r.uci());
+        assert!(a[ROOT].visits() < 30000, "stopped once proven");
+        // the duck square played keeps the win
+        let duck = a[best]
+            .children()
+            .find(|&c| Some(a[c].mv().to()) == r.duck)
+            .unwrap();
+        assert_eq!(proof(a, duck), Some(Proof::Win));
     }
 
     #[test]
