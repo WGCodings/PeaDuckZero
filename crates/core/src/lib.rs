@@ -32,6 +32,7 @@ pub mod zobrist;
 
 pub use bitboard::Bitboard;
 pub use game::{DrawReason, Game, GameResult, WinReason};
+pub use movegen::DuckDefence;
 pub use moves::{Move, MoveList};
 pub use position::{FenError, Position, START_FEN};
 pub use types::{Color, Piece, PieceType, Square};
