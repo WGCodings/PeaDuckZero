@@ -9,11 +9,25 @@
 //!
 //! A position where a king is missing (it was just captured) has no moves.
 
-use crate::attacks::{bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks};
+use crate::attacks::{
+    between, bishop_attacks, king_attacks, knight_attacks, pawn_attacks, rook_attacks,
+};
 use crate::bitboard::Bitboard;
 use crate::moves::{Move, MoveList};
 use crate::position::{Position, BLACK_OO, BLACK_OOO, WHITE_OO, WHITE_OOO};
 use crate::types::{Color, PieceType, Square};
+
+/// What the duck step can do about an attack on our king; see
+/// [`Position::duck_defence`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuckDefence {
+    /// The king isn't attacked: every duck square is safe.
+    Free,
+    /// Only these duck squares (never empty) block every attack.
+    Block(Bitboard),
+    /// No duck square saves the king.
+    Lost,
+}
 
 const PROMOS: [PieceType; 4] = [
     PieceType::Queen,
@@ -86,6 +100,58 @@ impl Position {
             | (bishop_attacks(k, blk) & bq)
             | (rook_attacks(k, blk) & rq);
         (attackers & self.color_bb(us)).any()
+    }
+
+    /// Duck step only: which duck squares stop the opponent from capturing
+    /// our king with its next move.
+    ///
+    /// The duck has to leave its square, so the attacks on our king are
+    /// computed without it. Then:
+    /// * no attack: every duck square is safe ([`DuckDefence::Free`]);
+    /// * an attack by a knight, pawn or king, or by sliders whose lines
+    ///   share no empty square: every duck square loses ([`DuckDefence::Lost`]);
+    /// * otherwise only the squares on every attack line are safe
+    ///   ([`DuckDefence::Block`]); every other duck square loses.
+    ///
+    /// "Loses" means the opponent can capture the king next, unless the
+    /// game is drawn first (fifty-move rule, repetition): callers check that.
+    /// In the move step, or without both kings, it returns `Free`.
+    pub fn duck_defence(&self) -> DuckDefence {
+        if !self.is_duck_step() {
+            return DuckDefence::Free;
+        }
+        let us = self.side_to_move();
+        let (own_king, their_king) = (
+            self.pieces_of(us, PieceType::King),
+            self.pieces_of(!us, PieceType::King),
+        );
+        if own_king.is_empty() || their_king.is_empty() {
+            return DuckDefence::Free;
+        }
+        let k = own_king.lsb();
+        let them = self.color_bb(!us);
+        let occ = self.occupied();
+        let jumpers = (pawn_attacks(us, k) & self.pieces(PieceType::Pawn))
+            | (knight_attacks(k) & self.pieces(PieceType::Knight))
+            | (king_attacks(k) & self.pieces(PieceType::King));
+        if (jumpers & them).any() {
+            return DuckDefence::Lost;
+        }
+        let rq = self.pieces(PieceType::Rook) | self.pieces(PieceType::Queen);
+        let bq = self.pieces(PieceType::Bishop) | self.pieces(PieceType::Queen);
+        let sliders = ((bishop_attacks(k, occ) & bq) | (rook_attacks(k, occ) & rq)) & them;
+        if sliders.is_empty() {
+            return DuckDefence::Free;
+        }
+        let mut safe = !(occ | self.duck_bb());
+        for s in sliders {
+            safe &= between(s, k);
+        }
+        if safe.is_empty() {
+            DuckDefence::Lost
+        } else {
+            DuckDefence::Block(safe)
+        }
     }
 
     /// Squares the duck can move to in the duck step.
@@ -285,5 +351,51 @@ mod tests {
         p.make_move(p.parse_move("h1e1").unwrap());
         assert!(!p.has_king(Color::White));
         assert!(p.legal_moves().is_empty());
+    }
+
+    /// `duck_defence` agrees with trying every duck square in random games.
+    #[test]
+    fn duck_defence_matches_brute_force() {
+        crate::init();
+        let mut rng = crate::rng::Rng::new(11);
+        let (mut free, mut block, mut lost) = (0, 0, 0);
+        for _ in 0..400 {
+            let mut p = Position::startpos();
+            for _ in 0..240 {
+                let moves = p.legal_moves();
+                if moves.is_empty() {
+                    break;
+                }
+                if p.is_duck_step() {
+                    let mut safe = Bitboard(0);
+                    for m in moves.iter() {
+                        let mut q = p;
+                        q.make_move(*m);
+                        if !q.king_capture_available() {
+                            safe |= Bitboard(1u64 << m.to().0);
+                        }
+                    }
+                    let expect = if safe == p.duck_targets() {
+                        free += 1;
+                        DuckDefence::Free
+                    } else if safe.is_empty() {
+                        lost += 1;
+                        DuckDefence::Lost
+                    } else {
+                        block += 1;
+                        DuckDefence::Block(safe)
+                    };
+                    assert_eq!(p.duck_defence(), expect, "{}", p.to_fen());
+                } else {
+                    assert_eq!(p.duck_defence(), DuckDefence::Free);
+                }
+                let m = moves[rng.below(moves.len() as u64) as usize];
+                p.make_move(m);
+            }
+        }
+        assert!(
+            free > 1000 && block > 100 && lost > 100,
+            "{free} {block} {lost}"
+        );
     }
 }

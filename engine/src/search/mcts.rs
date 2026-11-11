@@ -78,7 +78,7 @@ use std::time::Instant;
 
 use peaduck_core::game::any_duck_square;
 use peaduck_core::rng::Rng;
-use peaduck_core::{Game, Move, Square};
+use peaduck_core::{DuckDefence, Game, Move, Square};
 
 use super::tt::EvalTable;
 use super::{NetSearch, SearchContext, SearchParams};
@@ -824,12 +824,21 @@ impl Shared<'_> {
         // Wins for the side to move: it just captured the king; it can
         // capture it with its next move (below the root); or it has no legal
         // move at the start of its turn.
+        // Duck step: if no duck square stops the opponent from capturing
+        // our king next, the position is lost (below the root); if only
+        // some do, only those become children (see `duck_defence`). Not
+        // when the fifty-move rule ends the game first.
+        let defence = if pos.is_duck_step() && pos.halfmove_clock() < 100 {
+            pos.duck_defence()
+        } else {
+            DuckDefence::Free
+        };
         let terminal = if !pos.has_king(!stm) {
             Some(TERMINAL_WIN)
         } else if !pos.has_king(stm) {
             Some(TERMINAL_LOSS)
         } else if pos.is_duck_step() {
-            None
+            (ply > 0 && defence == DuckDefence::Lost).then_some(TERMINAL_LOSS)
         } else if ply > 0 && (pos.halfmove_clock() >= 100 || game.repetitions() >= 1) {
             // a repetition below the root counts as a draw at once
             Some(TERMINAL_DRAW)
@@ -844,6 +853,9 @@ impl Shared<'_> {
         }
 
         let mut eval = self.tt.evaluate(net, game);
+        if let DuckDefence::Block(safe) = defence {
+            eval.moves.retain(|(m, _)| safe.contains(m.to()));
+        }
         if eval.moves.len() > MAX_CHILDREN {
             // keep the steps with the highest logits (never in practice)
             eval.moves.sort_by(|x, y| y.1.total_cmp(&x.1));
@@ -1444,6 +1456,37 @@ mod tests {
         let (m, _) = run("4k3/8/8/q7/8/8/8/4K3 w - - 0 1 duck", 2000);
         assert!(m.is_duck());
         assert!(["b4", "c3", "d2"].contains(&m.to_uci().as_str()), "{m}");
+    }
+
+    #[test]
+    fn duck_defence_prunes_and_proves_losses() {
+        peaduck_core::init();
+        let mut net = PolicyNet::embedded();
+        let limits = SearchLimits {
+            nodes: Some(300),
+            ..Default::default()
+        };
+        let common = CommonOptions::default();
+        let stop = AtomicBool::new(false);
+        let params = SearchParams::default();
+        let ctx = ctx_for(&limits, &common, &stop, &params);
+
+        // root duck step: only the three blocking squares become children
+        let g = Game::from_fen("4k3/8/8/q7/8/8/8/4K3 w - - 0 1 duck").unwrap();
+        let mut m = Mcts::default();
+        m.search(&mut net, &g, &ctx);
+        assert_eq!(m.arena[ROOT].count(), 3);
+
+        // Kf2 walks into the knight on d3: its duck step is lost at once
+        let g = Game::from_fen("4k3/8/8/8/8/3n4/8/4K3 w - - 0 1").unwrap();
+        let mut m = Mcts::default();
+        let r = m.search(&mut net, &g, &ctx);
+        let kf2 = g.position().parse_move("e1f2").unwrap();
+        assert_ne!(r.best, kf2);
+        let a = &m.arena;
+        let child = a[ROOT].children().find(|&i| a[i].mv() == kf2).unwrap();
+        assert_eq!(a[child].terminal(), Some([0.0, 0.0, 1.0]));
+        assert_eq!(a[child].count(), 0);
     }
 
     #[test]
