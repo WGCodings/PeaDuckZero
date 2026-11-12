@@ -68,7 +68,15 @@ changes after the duck step. Everything is built on that:
   avoids proven losses while another move is left.
 * **Duck-step parameters:** `CPuctDuck`, `FpuReductionDuck` and
   `PolicyTempDuck` replace `CPuct`, `FpuReduction` and `PolicyTemp` at duck
-  steps (same defaults, separate for SPSA).
+  steps (tuned separately by SPSA).
+* **Refutation sharing** (after Wakwak's duck refutations): under a piece
+  move, a duck square not tried yet that doesn't block the opponent's best
+  reply to the most visited duck square starts from that square's (worse)
+  value, so visits go to the squares that might stop the reply first
+  (`RefuteWeight`, `RefuteMinVisits`).
+* **Duck certainty in time management:** visits spread over several duck
+  squares under the best move give more time, one clear square less
+  (`TmDuckShareC`, `TmDuckShareM`).
 
 ## Build and use
 

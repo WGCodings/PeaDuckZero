@@ -34,7 +34,7 @@
 //!
 //! Duck steps (nodes whose children are duck squares) use CPuctDuck,
 //! FpuReductionDuck and PolicyTempDuck in place of CPuct, FpuReduction and
-//! PolicyTemp; by default they have the same values.
+//! PolicyTemp, tuned separately.
 //!
 //! The non-standard UCI command `spsa` prints the *current* values (after
 //! any `setoption`) in OpenBench's SPSA input format
@@ -120,10 +120,20 @@ tunables! {
     /// cpuct (in place of CPuct; CPuctFactor, CPuctBase, the exponent and
     /// the gini scaling are shared), FPU reduction (in place of
     /// FpuReduction) and policy temperature (in place of PolicyTemp). The
-    /// root keeps its ...Root values. Defaults: the move-step values.
+    /// root keeps its ...Root values. Tuned separately by SPSA.
     "CPuctDuck" => cpuct_duck: default 127, min 1, max 1000, scale 100, step 1;
     "FpuReductionDuck" => fpu_reduction_duck: default 44, min 0, max 400, scale 100, step 2;
     "PolicyTempDuck" => policy_temp_duck: default 157, min 25, max 800, scale 100, step 3;
+    /// Refutation sharing between duck squares: under a piece move, the
+    /// most visited duck square (with at least RefuteMinVisits visits) and
+    /// the opponent's most visited reply to it. An unvisited duck square
+    /// that doesn't block that reply (its target square, or a square it
+    /// slides through) most likely loses to it as well, so its FPU moves
+    /// toward the sibling's value when that is lower: FPU + RefuteWeight ·
+    /// min(0, Q(sibling) − FPU). Squares that block the reply keep the
+    /// normal FPU. RefuteWeight 0 turns it off.
+    "RefuteWeight" => refute_weight: default 100, min 0, max 100, scale 100, step 5;
+    "RefuteMinVisits" => refute_min_visits: default 4, min 1, max 64, scale 1, step 1;
     /// Final move choice: among the root moves with at least
     /// BestMoveMinShare of the most visited move's visits, the one with the
     /// highest Q − BestMoveLcbC / √visits (a lower confidence bound: a move
@@ -147,7 +157,7 @@ tunables! {
     "TmIncPercent" => tm_inc_share: default 75, min 0, max 100, scale 100, step 5;
     /// ... and the hard limit as a multiple of the target time.
     "TmHardMult" => tm_hard_mult: default 300, min 100, max 800, scale 100, step 15;
-    /// Target-time factor = visit component × PV component, clamped to
+    /// Target-time factor = visit × PV × duck component, clamped to
     /// [TmMinMult, TmMaxMult] (and never past the hard limit).
     /// Visit component: (TmVisitsBase − share of the best move's visits)
     /// · TmVisitsMult: a clear best move gives less time, visits spread
@@ -158,8 +168,23 @@ tunables! {
     /// · TmPvDiffM: an evaluation that changes along the PV gives more time.
     "TmPvDiffC" => tm_pv_diff_c: default 0, min -50, max 100, scale 100, step 3;
     "TmPvDiffM" => tm_pv_diff_m: default 121, min 0, max 400, scale 100, step 8;
+    /// Duck component: 1 + (TmDuckShareC − share of the best duck
+    /// square's visits under the best move) · TmDuckShareM: a duck square
+    /// that is still unsure (visits spread over several) gives more time,
+    /// a clear one less (Wakwak's duck stability, MCTS style).
+    "TmDuckShareC" => tm_duck_share_c: default 70, min 0, max 100, scale 100, step 3;
+    "TmDuckShareM" => tm_duck_share_m: default 100, min 0, max 400, scale 100, step 8;
     "TmMinMult" => tm_min_mult: default 10, min 1, max 100, scale 100, step 2;
     "TmMaxMult" => tm_max_mult: default 500, min 100, max 1000, scale 100, step 25;
+}
+
+/// The target-time factor and its components (see `time_factor`).
+#[derive(Clone, Copy, Debug)]
+pub struct TimeFactor {
+    pub visits: f32,
+    pub pv: f32,
+    pub duck: f32,
+    pub factor: f32,
 }
 
 impl SearchParams {
@@ -174,12 +199,22 @@ impl SearchParams {
 
     /// Target-time factor: (visit component, PV component, clamped
     /// product). `share`: the best move's share of the root's visits
-    /// (0..1); `pv_diff`: |Q(best move) − Q(end of its PV)| (0..2).
-    pub fn time_factor(&self, share: f32, pv_diff: f32) -> (f32, f32, f32) {
+    /// (0..1); `pv_diff`: |Q(best move) − Q(end of its PV)| (0..2);
+    /// `duck_share`: share of the best duck square's visits under the best
+    /// move (None: no duck choice to make, component 1).
+    pub fn time_factor(&self, share: f32, pv_diff: f32, duck_share: Option<f32>) -> TimeFactor {
         let visits = (self.tm_visits_base - share) * self.tm_visits_mult;
         let pv = 1.0 + (pv_diff - self.tm_pv_diff_c) * self.tm_pv_diff_m;
-        let factor = (visits * pv).clamp(self.tm_min_mult, self.tm_max_mult);
-        (visits, pv, factor)
+        let duck = duck_share.map_or(1.0, |d| {
+            (1.0 + (self.tm_duck_share_c - d) * self.tm_duck_share_m).max(0.0)
+        });
+        let factor = (visits * pv * duck).clamp(self.tm_min_mult, self.tm_max_mult);
+        TimeFactor {
+            visits,
+            pv,
+            duck,
+            factor,
+        }
     }
 
     /// cpuct for a move-step node with `visits` visits (without the gini

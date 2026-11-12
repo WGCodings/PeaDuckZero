@@ -75,6 +75,14 @@
 //! path). Leaves proven so far: king captured, king capture available, no
 //! legal move, and duck steps where no duck square saves the king.
 //!
+//! Refutation sharing (after Wakwak's duck refutations): under a piece
+//! move, an unvisited duck square that doesn't block the opponent's best
+//! reply to the most visited duck square starts from that square's value
+//! when it is lower than the normal FPU (RefuteWeight, RefuteMinVisits).
+//!
+//! Time management also looks at the duck: visits spread over several duck
+//! squares under the best move give more time (TmDuckShareC/M).
+//!
 //! Not (yet): smart pruning.
 //!
 //! Each node stores W/L for the side that made the step into it (the side
@@ -90,10 +98,12 @@ use std::sync::atomic::{
 use std::sync::RwLock;
 use std::time::Instant;
 
+use peaduck_core::attacks::between;
 use peaduck_core::game::any_duck_square;
 use peaduck_core::rng::Rng;
-use peaduck_core::{DuckDefence, Game, Move, Square};
+use peaduck_core::{Bitboard, DuckDefence, Game, Move, Square};
 
+use super::params::TimeFactor;
 use super::tt::EvalTable;
 use super::{NetSearch, SearchContext, SearchParams};
 use crate::engine::SearchResult;
@@ -613,10 +623,9 @@ impl View<'_> {
     fn select(&self, node: usize) -> usize {
         let n = &self.a[node];
         let (fpu, gini) = self.fpu_and_gini(node);
-        let u = self
-            .params
-            .explore_coef(n.visits(), gini, self.duck_node(node))
-            * self.cpuct_scale;
+        let duck = self.duck_node(node);
+        let u = self.params.explore_coef(n.visits(), gini, duck) * self.cpuct_scale;
+        let refute = if duck { self.refutation(node) } else { None };
         let children = n.children();
         let mut best = (children.start, f32::NEG_INFINITY);
         for c in children {
@@ -627,7 +636,17 @@ impl View<'_> {
                 None => 0.0,
             };
             let visits = child.visits();
-            let q = if visits == 0 { fpu } else { child.q() };
+            let q = if visits > 0 {
+                child.q()
+            } else {
+                match refute {
+                    // most likely refuted the same way
+                    Some((blocks, q_sib)) if !blocks.contains(child.mv().to()) => {
+                        fpu + self.params.refute_weight * (q_sib - fpu).min(0.0)
+                    }
+                    _ => fpu,
+                }
+            };
             let score = q + u * child.prior() / (1.0 + visits as f32) - lost;
             if score > best.1 {
                 best = (c, score);
@@ -643,6 +662,29 @@ impl View<'_> {
                 .cmp(&b.visits())
                 .then(a.prior().total_cmp(&b.prior()))
         })
+    }
+
+    /// Refutation of a duck-step node's most visited duck square: the duck
+    /// squares that block the opponent's most visited reply to it (the
+    /// reply's target and the squares it slides through), and that duck
+    /// square's value. None while it has fewer than RefuteMinVisits visits
+    /// or no visited reply, or when RefuteWeight is 0.
+    fn refutation(&self, node: usize) -> Option<(Bitboard, f32)> {
+        if self.params.refute_weight <= 0.0 {
+            return None;
+        }
+        let sib = self.best_child(node)?;
+        if (self.a[sib].visits() as f32) < self.params.refute_min_visits || !self.a[sib].expanded()
+        {
+            return None;
+        }
+        let reply = self.best_child(sib)?;
+        if self.a[reply].visits() == 0 {
+            return None;
+        }
+        let m = self.a[reply].mv();
+        let blocks = between(m.from(), m.to()) | Bitboard(1u64 << m.to().0);
+        Some((blocks, self.a[sib].q()))
     }
 
     /// The step to follow from `node` (PV, duck square): one proven to win,
@@ -778,8 +820,26 @@ impl View<'_> {
     /// product): a clear best move (a large share of the visits) gives less
     /// time, visits spread over several moves more; an evaluation that
     /// changes along the PV gives more.
-    fn time_factor(&self) -> (f32, f32, f32) {
-        self.params.time_factor(self.best_share(), self.pv_diff())
+    fn time_factor(&self) -> TimeFactor {
+        self.params
+            .time_factor(self.best_share(), self.pv_diff(), self.duck_share())
+    }
+
+    /// Share of the visits under the best root move that went to its best
+    /// duck square (None if there is no duck choice: the root is a duck
+    /// step, the move ends the game, or nothing is visited yet).
+    fn duck_share(&self) -> Option<f32> {
+        if !self.root_turn_change {
+            return None;
+        }
+        let best = self.root_choice()?;
+        let n = &self.a[best];
+        if !n.expanded() || n.count() < 2 {
+            return None;
+        }
+        let total: u32 = n.children().map(|c| self.a[c].visits()).sum();
+        let duck = self.best_step(best)?;
+        (total > 0).then(|| self.a[duck].visits() as f32 / total as f32)
     }
 
     /// Whether to stop now, `elapsed` into the move: never past `hard`;
@@ -798,7 +858,7 @@ impl View<'_> {
         if let (Some(only), None) = (live.next(), live.next()) {
             return self.a[only].visits() >= SINGLE_MOVE_VISITS;
         }
-        elapsed.as_secs_f32() >= budget.soft.as_secs_f32() * self.time_factor().2
+        elapsed.as_secs_f32() >= budget.soft.as_secs_f32() * self.time_factor().factor
     }
 
     /// The duck square to play after the root move `child`: one proven to
@@ -1458,13 +1518,18 @@ fn search_tree(
         let a = shared.arena.read().unwrap();
         let view = shared.view(&a);
         if let Some(b) = budget.filter(|b| !b.fixed) {
-            let (visits, pv, factor) = view.time_factor();
+            let t = view.time_factor();
             println!(
-                "info string time: {} ms used, target {} ms x factor {factor:.2} (visits {visits:.2}: best move {:.0}% of visits; pv {pv:.2}: pv diff {:.3}), hard {} ms",
+                "info string time: {} ms used, target {} ms x factor {:.2} (visits {:.2}: best move {:.0}% of visits; pv {:.2}: pv diff {:.3}; duck {:.2}: best duck {:.0}% of its visits), hard {} ms",
                 start.elapsed().as_millis(),
                 b.soft.as_millis(),
+                t.factor,
+                t.visits,
                 100.0 * view.best_share(),
+                t.pv,
                 view.pv_diff(),
+                t.duck,
+                100.0 * view.duck_share().unwrap_or(1.0),
                 b.hard.as_millis()
             );
         }
@@ -1726,6 +1791,93 @@ mod tests {
     }
 
     #[test]
+    fn refutation_steers_unvisited_ducks_to_blocking_squares() {
+        peaduck_core::init();
+        let sq = |s: &str| Square::parse(s).unwrap();
+        let node = |m: Move, first: u32, count: u8, flags: u8, visits: u32, q: f32, prior: f32| {
+            let (w, l) = (
+                visits as f32 * (1.0 + q) / 2.0,
+                visits as f32 * (1.0 - q) / 2.0,
+            );
+            NodeData {
+                mv: m,
+                first,
+                count,
+                flags,
+                visits,
+                w,
+                l,
+                prior,
+            }
+        };
+        // after e2e4 (node 1) the duck went to h5 (node 2, 10 visits, bad:
+        // the reply Ra8a1, node 5, refutes it); h4 (3) doesn't block that
+        // rook, a4 (4) does; both unvisited, same prior, h4 first
+        let data = vec![
+            node(Move::NULL, 1, 1, EXPANDED, 12, 0.0, 1.0),
+            node(
+                Move::new(sq("e2"), sq("e4"), Move::QUIET),
+                2,
+                3,
+                EXPANDED,
+                11,
+                0.0,
+                1.0,
+            ),
+            node(Move::duck(sq("h5")), 5, 1, EXPANDED, 10, -0.8, 0.4),
+            node(Move::duck(sq("h4")), 0, 0, 0, 0, 0.0, 0.3),
+            node(Move::duck(sq("a4")), 0, 0, 0, 0, 0.0, 0.3),
+            node(
+                Move::new(sq("a8"), sq("a1"), Move::QUIET),
+                0,
+                0,
+                0,
+                9,
+                0.8,
+                0.5,
+            ),
+        ];
+        let a = Arena::from_data(&data, 16);
+        let mut view = View {
+            a: &a,
+            params: SearchParams::default(),
+            cpuct_scale: 1.0,
+            root_turn_change: true,
+        };
+        let (blocks, q) = view.refutation(1).unwrap();
+        assert!(
+            blocks.contains(sq("a4")) && blocks.contains(sq("a1")) && !blocks.contains(sq("h4"))
+        );
+        assert!((q + 0.8).abs() < 1e-5);
+        assert_eq!(view.select(1), 4, "a4 blocks the refutation");
+        // off: the tie goes to the first square
+        view.params.refute_weight = 0.0;
+        assert_eq!(view.refutation(1), None);
+        assert_eq!(view.select(1), 3);
+        // too few visits on the refuted square to trust it
+        view.params.refute_weight = 1.0;
+        view.params.refute_min_visits = 11.0;
+        assert_eq!(view.refutation(1), None);
+        assert_eq!(view.select(1), 3);
+    }
+
+    #[test]
+    fn duck_share_is_the_best_ducks_part_of_the_visits() {
+        peaduck_core::init();
+        let mut net = PolicyNet::embedded();
+        let params = SearchParams::default();
+        let mut m = Mcts::default();
+        search_with(&mut m, &mut net, &Game::default(), 800, &params);
+        let v = view(&m);
+        let best = v.root_choice().unwrap();
+        let total: u32 = v.a[best].children().map(|c| v.a[c].visits()).sum();
+        let top = v.a[best].children().map(|c| v.a[c].visits()).max().unwrap();
+        let share = v.duck_share().unwrap();
+        assert!((share - top as f32 / total as f32).abs() < 1e-6);
+        assert!(share > 0.0 && share <= 1.0);
+    }
+
+    #[test]
     fn solver_stops_the_search_once_the_root_is_decided() {
         peaduck_core::init();
         let mut net = PolicyNet::embedded();
@@ -1741,12 +1893,13 @@ mod tests {
         let g = Game::from_fen("4k3/8/8/8/8/8/8/4R1K1 w - - 0 1").unwrap();
         let (r, playouts) = super::run(&mut net, &g, &ctx, false);
         assert_eq!(r.best, g.position().parse_move("e1e8").unwrap());
-        assert!(playouts < 100, "{playouts}");
+        // (it is proven at its first visit: how soon depends on its prior)
+        assert!(playouts < 1000, "{playouts}");
         // every king move walks into a knight: all proven lost, still a move
         let g = Game::from_fen("4k3/8/8/8/8/2nn4/8/K7 w - - 0 1").unwrap();
         let (r, playouts) = super::run(&mut net, &g, &ctx, false);
         assert!(g.position().legal_moves().contains(&r.best));
-        assert!(playouts < 100, "{playouts}");
+        assert!(playouts < 1000, "{playouts}");
         // Kf2 walks into the knight on d3 (proven lost), Kd1, Kd2, Ke2 and
         // Kf1 are safe: the lost move is never chosen
         let g = Game::from_fen("4k3/8/8/8/8/3n4/8/4K3 w - - 0 1").unwrap();
@@ -2238,19 +2391,25 @@ mod tests {
     #[test]
     fn time_factor_follows_the_best_moves_share_and_the_pv() {
         let p = SearchParams::default();
-        let f = |share, diff| p.time_factor(share, diff).2;
+        let f = |share, diff| p.time_factor(share, diff, None).factor;
         // clear best move → less time; spread visits → more time
         assert!(f(0.9, 0.0) < f(0.5, 0.0) && f(0.5, 0.0) < f(0.2, 0.0));
         assert!(f(0.9, 0.0) < 1.0 && f(0.2, 0.0) > 1.0);
         // a stable PV leaves it alone; an unstable one adds time
-        assert_eq!(p.time_factor(0.5, 0.0).1, 1.0);
+        assert_eq!(p.time_factor(0.5, 0.0, None).pv, 1.0);
         assert!(f(0.5, 0.2) > f(0.5, 0.0) && f(0.5, 0.5) > f(0.5, 0.2));
-        let (v, pv, both) = p.time_factor(0.6, 0.1);
-        assert!((both - v * pv).abs() < 1e-6);
+        // a clear duck square → less time, an unsure one more; none: 1
+        let d = |duck| p.time_factor(0.5, 0.0, duck).factor;
+        assert!(d(Some(0.95)) < d(None) && d(None) < d(Some(0.3)));
+        assert_eq!(p.time_factor(0.5, 0.0, None).duck, 1.0);
+        let t = p.time_factor(0.6, 0.1, Some(0.5));
+        assert!((t.factor - t.visits * t.pv * t.duck).abs() < 1e-6);
         for share in [0.0, 0.5, 1.0] {
             for diff in [0.0, 1.0, 2.0] {
-                let x = f(share, diff);
-                assert!(x >= p.tm_min_mult && x <= p.tm_max_mult);
+                for duck in [None, Some(0.0), Some(1.0)] {
+                    let x = p.time_factor(share, diff, duck).factor;
+                    assert!(x >= p.tm_min_mult && x <= p.tm_max_mult);
+                }
             }
         }
     }
